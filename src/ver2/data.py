@@ -15,6 +15,14 @@ def load_raw(csv_path: Path) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
     df["date"] = pd.to_datetime(df["date"])  # naive date
     df = df.sort_values("date").reset_index(drop=True)
+
+    # 数值列缺失值插补：先按时间插值，再前向/后向填补，避免后续取对数出现 NaN
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if num_cols:
+        df_num = df.set_index("date")[num_cols]
+        df_num = df_num.interpolate(method="time", limit_direction="both")
+        df_num = df_num.ffill().bfill()
+        df[num_cols] = df_num.reset_index(drop=True)
     return df
 
 

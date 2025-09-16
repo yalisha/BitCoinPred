@@ -18,6 +18,13 @@ from .model_tft import TFTCfg, TFTMultiHQuantile, train_one, predict
 from .plots import plot_price_series, plot_step_series, plot_quantile_band, plot_step_metric, plot_bar
 
 
+def _ensure_finite(name: str, arr: np.ndarray) -> None:
+    if not np.all(np.isfinite(arr)):
+        bad = np.argwhere(~np.isfinite(arr))
+        loc = bad[0].tolist() if bad.size else []
+        raise ValueError(f"Non-finite values detected in {name} at index {loc}")
+
+
 def to_price_from_target(c0: np.ndarray, y: np.ndarray, target_type: str) -> np.ndarray:
     t = target_type.lower()
     if t == 'price':
@@ -93,7 +100,8 @@ def main():
                       (Xo_tr, Xk_tr, Xs_tr, y_tr),
                       (Xo_va, Xk_va, Xs_va, y_va),
                       epochs=config.EPOCHS, lr=config.LR, batch_size=config.BATCH_SIZE, device='cpu',
-                      step_weights_np=step_w, mse_aux_weight=config.MSE_AUX_WEIGHT)
+                      step_weights_np=step_w, mse_aux_weight=config.MSE_AUX_WEIGHT,
+                      grad_clip_norm=config.GRAD_CLIP)
 
     # 预测
     q_va_z, det_va = predict(model, Xo_va, Xk_va, Xs_va)
@@ -103,8 +111,8 @@ def main():
     y_sd3 = y_sd.reshape(1, y_sd.shape[1], 1)
     q_va = q_va_z * y_sd3 + y_mu3
     q_te = q_te_z * y_sd3 + y_mu3
-    q_va = np.nan_to_num(q_va, nan=0.0, posinf=0.0, neginf=0.0)
-    q_te = np.nan_to_num(q_te, nan=0.0, posinf=0.0, neginf=0.0)
+    _ensure_finite("val_quantiles", q_va)
+    _ensure_finite("test_quantiles", q_te)
     # 取中位数
     q_index = config.QUANTILES.index(0.5) if 0.5 in config.QUANTILES else len(config.QUANTILES)//2
     yhat_va = q_va[..., q_index]
@@ -138,14 +146,14 @@ def main():
     val_cov_steps = []
     test_cov_steps = []
     for h in range(config.HORIZON):
-        val_rmse_steps.append(rmse(to_price_from_target(va_seq.c0, va_seq.y[:,h], config.PRED_TARGET),
-                                   to_price_from_target(va_seq.c0, yhat_va[:,h], config.PRED_TARGET)))
-        val_mae_steps.append(mae(to_price_from_target(va_seq.c0, va_seq.y[:,h], config.PRED_TARGET),
-                                 to_price_from_target(va_seq.c0, yhat_va[:,h], config.PRED_TARGET)))
-        test_rmse_steps.append(rmse(to_price_from_target(te_seq.c0, te_seq.y[:,h], config.PRED_TARGET),
-                                    to_price_from_target(te_seq.c0, yhat_te[:,h], config.PRED_TARGET)))
-        test_mae_steps.append(mae(to_price_from_target(te_seq.c0, te_seq.y[:,h], config.PRED_TARGET),
-                                  to_price_from_target(te_seq.c0, yhat_te[:,h], config.PRED_TARGET)))
+        pred_va_h = to_price_from_target(va_seq.c0, yhat_va[:,h], config.PRED_TARGET)
+        pred_te_h = to_price_from_target(te_seq.c0, yhat_te[:,h], config.PRED_TARGET)
+        _ensure_finite(f"val_price_pred_h{h+1}", pred_va_h)
+        _ensure_finite(f"test_price_pred_h{h+1}", pred_te_h)
+        val_rmse_steps.append(rmse(to_price_from_target(va_seq.c0, va_seq.y[:,h], config.PRED_TARGET), pred_va_h))
+        val_mae_steps.append(mae(to_price_from_target(va_seq.c0, va_seq.y[:,h], config.PRED_TARGET), pred_va_h))
+        test_rmse_steps.append(rmse(to_price_from_target(te_seq.c0, te_seq.y[:,h], config.PRED_TARGET), pred_te_h))
+        test_mae_steps.append(mae(to_price_from_target(te_seq.c0, te_seq.y[:,h], config.PRED_TARGET), pred_te_h))
         # 覆盖率（目标空间）
         val_cov_steps.append(coverage(va_seq.y[:,h], q_va[:,h,ql_idx], q_va[:,h,qh_idx]))
         test_cov_steps.append(coverage(te_seq.y[:,h], q_te[:,h,ql_idx], q_te[:,h,qh_idx]))
@@ -223,11 +231,13 @@ def main():
             a.append(float(sol[0])); b.append(float(sol[1]))
             # 应用到测试
             yhat_te_med[:,h] = a[-1]*yhat_te_med[:,h] + b[-1]
+        _ensure_finite("calibrated_q50_val", yhat_va_med)
+        _ensure_finite("calibrated_q50_test", yhat_te_med)
         # 校准后的价格指标
         test_rmse_steps_cal = []
         for h in range(config.HORIZON):
             test_rmse_steps_cal.append(rmse(to_price_from_target(te_seq.c0, te_seq.y[:,h], config.PRED_TARGET),
-                                            to_price_from_target(te_seq.c0, yhat_te_med[:,h], config.PRED_TARGET)))
+                                           to_price_from_target(te_seq.c0, yhat_te_med[:,h], config.PRED_TARGET)))
         np.save(run_dir / "pred/test_rmse_steps_calibrated.npy", np.array(test_rmse_steps_cal))
         plot_step_metric(np.array(test_rmse_steps_cal), "TEST RMSE per step (calibrated)", run_dir / "figs/test_rmse_steps_calibrated.png")
         with (run_dir / "calibration_q50.json").open("w", encoding="utf-8") as f:

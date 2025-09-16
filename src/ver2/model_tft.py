@@ -9,6 +9,7 @@ from typing import List, Tuple, Optional
 import numpy as np
 import torch
 from torch import nn
+import math
 
 
 def _to_t(x: np.ndarray) -> torch.Tensor:
@@ -143,7 +144,8 @@ def train_one(cfg: TFTCfg,
               epochs: int = 20, lr: float = 1e-3, batch_size: int = 128,
               device: str = "cpu",
               step_weights_np: Optional[np.ndarray] = None,
-              mse_aux_weight: float = 0.1):
+              mse_aux_weight: float = 0.1,
+              grad_clip_norm: float = 1.0):
     Xo_tr, Xk_tr, Xs_tr, y_tr = tr
     Xo_va, Xk_va, Xs_va, y_va = va
     model.to(device)
@@ -161,7 +163,33 @@ def train_one(cfg: TFTCfg,
             np.random.shuffle(idx)
         for i in range(0, len(y), batch_size):
             sel = idx[i:i+batch_size]
-            yield (_to_t(Xo[sel]).to(device), _to_t(Xk[sel]).to(device), _to_t(Xs[sel]).to(device), _to_t(y[sel]).to(device))
+            yield (
+                sel,
+                _to_t(Xo[sel]).to(device),
+                _to_t(Xk[sel]).to(device),
+                _to_t(Xs[sel]).to(device),
+                _to_t(y[sel]).to(device),
+            )
+
+    def describe_tensor(t: torch.Tensor) -> dict:
+        arr = t.detach().cpu().numpy().astype(np.float64)
+        return {
+            "min": float(np.nanmin(arr)),
+            "max": float(np.nanmax(arr)),
+            "mean": float(np.nanmean(arr)),
+            "std": float(np.nanstd(arr)),
+        }
+
+    def log_batch_issue(reason: str, epoch: int, batch_id: int, sel: np.ndarray,
+                        Xo: torch.Tensor, Xk: torch.Tensor, Xs: torch.Tensor, y: torch.Tensor,
+                        q_pred: Optional[torch.Tensor] = None) -> None:
+        print(f"[Diag] {reason} at epoch={epoch} batch={batch_id} size={len(sel)} idx_sample={sel[:5].tolist()}")
+        print(f"       y stats {describe_tensor(y)}")
+        print(f"       Xo stats {describe_tensor(Xo)}")
+        print(f"       Xk stats {describe_tensor(Xk)}")
+        print(f"       Xs stats {describe_tensor(Xs)}")
+        if q_pred is not None:
+            print(f"       q_pred stats {describe_tensor(q_pred)}")
 
     q_index = (cfg.quantiles.index(0.5) if (cfg.quantiles and 0.5 in cfg.quantiles) else (len(cfg.quantiles)//2 if cfg.quantiles else 0))
     mse_aux_weight = float(mse_aux_weight)
@@ -173,7 +201,10 @@ def train_one(cfg: TFTCfg,
         model.train()
         tr_loss = 0.0
         n_tr = 0
-        for Xo, Xk, Xs, y in batched(Xo_tr, Xk_tr, Xs_tr, y_tr, shuffle=True):
+        grad_norms = []
+        grad_has_nan = False
+        problematic_logged = False
+        for batch_id, (sel, Xo, Xk, Xs, y) in enumerate(batched(Xo_tr, Xk_tr, Xs_tr, y_tr, shuffle=True), start=1):
             opt.zero_grad()
             q_pred, _ = model(Xo, Xk, Xs)
             loss_pin = pinball_loss(y, q_pred, cfg.quantiles, step_weights=step_weights_t)
@@ -184,8 +215,24 @@ def train_one(cfg: TFTCfg,
                 loss = loss_pin + mse_aux_weight * loss_mse
             else:
                 loss = loss_pin
+            if torch.isnan(loss) or torch.isinf(loss):
+                log_batch_issue("loss_nan", ep+1, batch_id, sel, Xo, Xk, Xs, y, q_pred=q_pred)
+                raise ValueError(f"NaN/Inf loss encountered at epoch {ep+1}")
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            total_sq = 0.0
+            for p in model.parameters():
+                if p.grad is None:
+                    continue
+                if torch.isnan(p.grad).any() or torch.isinf(p.grad).any():
+                    grad_has_nan = True
+                    if not problematic_logged:
+                        log_batch_issue("grad_nan", ep+1, batch_id, sel, Xo, Xk, Xs, y, q_pred=q_pred)
+                        problematic_logged = True
+                    raise ValueError(f"NaN/Inf gradient encountered at epoch {ep+1}")
+                total_sq += float(torch.sum(p.grad.detach() * p.grad.detach()))
+            grad_norms.append(total_sq ** 0.5)
+            if grad_clip_norm is not None and grad_clip_norm > 0:
+                nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
             opt.step()
             tr_loss += loss.item() * len(y)
             n_tr += len(y)
@@ -206,6 +253,19 @@ def train_one(cfg: TFTCfg,
                 va_loss = (loss_pin + mse_aux_weight * loss_mse).item()
             else:
                 va_loss = loss_pin.item()
+        if math.isnan(tr_loss) or math.isnan(va_loss) or math.isinf(tr_loss) or math.isinf(va_loss):
+            raise ValueError(f"Non-finite epoch loss encountered at epoch {ep+1}")
+
+        lr_now = opt.param_groups[0]['lr']
+        grad_avg = float(np.mean(grad_norms)) if grad_norms else 0.0
+        grad_max = float(np.max(grad_norms)) if grad_norms else 0.0
+        msg = (
+            f"Epoch {ep+1}/{epochs} | train_loss={tr_loss:.6f} | val_loss={va_loss:.6f} "
+            f"| grad_avg={grad_avg:.6f} | grad_max={grad_max:.6f} | lr={lr_now:.2e} | wait={wait}"
+        )
+        if grad_has_nan:
+            msg += " | grad_has_nan=True"
+        print(msg)
 
         if va_loss < best - 1e-6:
             best = va_loss
@@ -214,6 +274,7 @@ def train_one(cfg: TFTCfg,
         else:
             wait += 1
             if wait >= patience:
+                print(f"Early stopping triggered at epoch {ep+1} with wait={wait}")
                 break
         scheduler.step(va_loss)
 
