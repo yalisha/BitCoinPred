@@ -22,6 +22,7 @@ def load_raw(csv_path: Path) -> pd.DataFrame:
         df_num = df.set_index("date")[num_cols]
         df_num = df_num.interpolate(method="time", limit_direction="both")
         df_num = df_num.ffill().bfill()
+        df_num = df_num.fillna(0.0)
         df[num_cols] = df_num.reset_index(drop=True)
     return df
 
