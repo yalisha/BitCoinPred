@@ -26,16 +26,31 @@ VAL_END   = "2022-12-31"
 OUT_DIR = BASE_DIR / "outputs_ver2"
 
 # 训练参数
-EPOCHS = 60
-BATCH_SIZE = 32
-HIDDEN_SIZE = 64
-LR = 5e-4
-DROPOUT = 0.3
+EPOCHS = 80
+BATCH_SIZE = 24
+HIDDEN_SIZE = 128
+LR = 3e-4
+DROPOUT = 0.2
 NHEAD = 8
 LSTM_LAYERS = 2
-ATTN_DROPOUT = 0.1
-FF_DROPOUT = 0.1
-GRAD_CLIP = 5.0
+ATTN_DROPOUT = 0.2
+FF_DROPOUT = 0.15
+GRAD_CLIP = 3.0
+WEIGHT_DECAY = 1e-5
+
+# 时间序列交叉验证
+CV_ENABLED = True
+CV_FOLDS = 4
+CV_EPOCHS = 40
+CV_MIN_TRAIN_SAMPLES = 200
+CV_VAL_SAMPLES = 0  # 0 表示使用验证集样本数作为窗口
+
+# 超参搜索（Optuna）
+ENABLE_OPTUNA = True
+OPTUNA_TRIALS = 20
+OPTUNA_TIMEOUT = 1800  # 秒，0 表示不限
+OPTUNA_STUDY = "tft_ver2"
+OPTUNA_STORAGE = None  # 例如 "sqlite:///tft_ver2.db"
 
 # 损失加权与校准
 # q50 的 MSE 辅助损失权重

@@ -192,12 +192,13 @@ def train_one(cfg: TFTCfg,
               device: Union[str, torch.device] = "cpu",
               step_weights_np: Optional[np.ndarray] = None,
               mse_aux_weight: float = 0.1,
-              grad_clip_norm: float = 1.0):
+              grad_clip_norm: float = 1.0,
+              weight_decay: float = 0.0):
     Xo_tr, Xk_tr, Xs_tr, y_tr = tr
     Xo_va, Xk_va, Xs_va, y_va = va
     torch_device = _resolve_device(device)
     model.to(torch_device)
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     # Some torch versions don't support 'verbose' arg; omit for compatibility
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=2)
     best = float("inf")
