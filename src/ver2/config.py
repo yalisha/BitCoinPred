@@ -45,6 +45,14 @@ CV_EPOCHS = 40
 CV_MIN_TRAIN_SAMPLES = 200
 CV_VAL_SAMPLES = 0  # 0 表示使用验证集样本数作为窗口
 
+# 评估分段（类似论文中的分时评估）
+EVAL_SEGMENTS = [
+    {"name": "early_half", "fraction": [0.0, 0.5]},
+    {"name": "late_half", "fraction": [0.5, 1.0]},
+    {"name": "recent_365d", "days": 365},
+    {"name": "recent_180d", "days": 180},
+]
+
 # 超参搜索（Optuna）
 ENABLE_OPTUNA = True
 OPTUNA_TRIALS = 20

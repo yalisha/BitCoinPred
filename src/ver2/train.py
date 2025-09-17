@@ -84,6 +84,97 @@ def _denormalize_targets(q_pred_z: np.ndarray, stats: Dict[str, np.ndarray]) -> 
     return q_pred_z * y_sd + y_mu
 
 
+def _compute_metric_summary(y_true: np.ndarray,
+                            q_pred: np.ndarray,
+                            c0: np.ndarray,
+                            target_type: str,
+                            quantiles: List[float]) -> Dict[str, object]:
+    q_index = quantiles.index(0.5) if 0.5 in quantiles else len(quantiles) // 2
+    yhat = q_pred[..., q_index]
+
+    price_true_steps = np.empty_like(y_true)
+    price_pred_steps = np.empty_like(yhat)
+    for h in range(y_true.shape[1]):
+        price_true_steps[:, h] = to_price_from_target(c0, y_true[:, h], target_type)
+        price_pred_steps[:, h] = to_price_from_target(c0, yhat[:, h], target_type)
+
+    diff_price = price_pred_steps - price_true_steps
+    rmse_steps = np.sqrt(np.mean(diff_price ** 2, axis=0))
+    mae_steps = np.mean(np.abs(diff_price), axis=0)
+
+    denom = np.clip(np.abs(price_true_steps), 1e-8, None)
+    rel_rmse_steps = np.sqrt(np.mean((diff_price / denom) ** 2, axis=0))
+    rel_mae_steps = np.mean(np.abs(diff_price) / denom, axis=0)
+
+    diff_log = y_true - yhat
+    log_rmse_steps = np.sqrt(np.mean(diff_log ** 2, axis=0))
+    log_mae_steps = np.mean(np.abs(diff_log), axis=0)
+
+    coverage_steps: List[float] = []
+    for h in range(y_true.shape[1]):
+        lo = q_pred[:, h, 0]
+        hi = q_pred[:, h, -1]
+        coverage_steps.append(float(np.mean((y_true[:, h] >= lo) & (y_true[:, h] <= hi))))
+
+    metrics = {
+        "rmse_h1_price": float(rmse_steps[0]),
+        "mae_h1_price": float(mae_steps[0]),
+        "rel_rmse_h1_price": float(rel_rmse_steps[0]),
+        "rel_mae_h1_price": float(rel_mae_steps[0]),
+        "rmse_avg_steps": float(np.mean(rmse_steps)),
+        "mae_avg_steps": float(np.mean(mae_steps)),
+        "rel_rmse_avg_steps": float(np.mean(rel_rmse_steps)),
+        "rel_mae_avg_steps": float(np.mean(rel_mae_steps)),
+        "log_rmse_h1": float(log_rmse_steps[0]),
+        "log_mae_h1": float(log_mae_steps[0]),
+        "log_rmse_avg_steps": float(np.mean(log_rmse_steps)),
+        "log_mae_avg_steps": float(np.mean(log_mae_steps)),
+        "coverage_h1": float(coverage_steps[0]),
+        "coverage_avg_steps": float(np.mean(coverage_steps)),
+    }
+
+    return {
+        "yhat": yhat,
+        "price_true_steps": price_true_steps,
+        "price_pred_steps": price_pred_steps,
+        "rmse_steps_price": [float(x) for x in rmse_steps],
+        "mae_steps_price": [float(x) for x in mae_steps],
+        "rel_rmse_steps": [float(x) for x in rel_rmse_steps],
+        "rel_mae_steps": [float(x) for x in rel_mae_steps],
+        "log_rmse_steps": [float(x) for x in log_rmse_steps],
+        "log_mae_steps": [float(x) for x in log_mae_steps],
+        "coverage_steps": coverage_steps,
+        "metrics": metrics,
+    }
+
+
+def _segment_indices(dates: Optional[pd.Series], seg_cfg: Dict[str, object]) -> np.ndarray:
+    if dates is None or len(dates) == 0:
+        return np.array([], dtype=int)
+    d = pd.to_datetime(dates).reset_index(drop=True)
+    n = len(d)
+    if "fraction" in seg_cfg and isinstance(seg_cfg["fraction"], (list, tuple)) and len(seg_cfg["fraction"]) == 2:
+        start_frac, end_frac = seg_cfg["fraction"]
+        start = int(np.floor(max(0.0, min(1.0, start_frac)) * n))
+        end = int(np.ceil(max(0.0, min(1.0, end_frac)) * n))
+        end = max(end, start + 1)
+        end = min(end, n)
+        return np.arange(start, end, dtype=int)
+    if "days" in seg_cfg:
+        days = int(seg_cfg["days"])
+        cutoff = d.iloc[-1] - pd.Timedelta(days=days)
+        idx = np.where(d >= cutoff)[0]
+        return idx.astype(int)
+    start = seg_cfg.get("start") or seg_cfg.get("start_date")
+    end = seg_cfg.get("end") or seg_cfg.get("end_date")
+    if start is None and end is None:
+        return np.arange(0, n, dtype=int)
+    start_ts = pd.Timestamp(start) if start is not None else d.iloc[0]
+    end_ts = pd.Timestamp(end) if end is not None else d.iloc[-1]
+    mask = (d >= start_ts) & (d <= end_ts)
+    return np.where(mask)[0].astype(int)
+
+
 def _resolve_nhead(d_model: int, requested: int) -> int:
     requested = max(1, int(requested))
     if d_model % requested == 0:
@@ -128,89 +219,42 @@ def _build_time_series_folds(n_samples: int, val_len: int, n_folds: int, min_tra
 
 def _compute_fold_metrics(y_true: np.ndarray, q_pred: np.ndarray, c0: np.ndarray,
                           target_type: str, quantiles: List[float]) -> Tuple[Dict[str, float], Dict[str, List[float]]]:
-    q_index = quantiles.index(0.5) if 0.5 in quantiles else len(quantiles) // 2
-    yhat = q_pred[..., q_index]
-    price_true_h1 = to_price_from_target(c0, y_true[:, 0], target_type)
-    price_pred_h1 = to_price_from_target(c0, yhat[:, 0], target_type)
-
-    def rmse(a, b):
-        a = np.asarray(a); b = np.asarray(b)
-        return float(np.sqrt(np.mean((a - b) ** 2)))
-
-    def mae(a, b):
-        a = np.asarray(a); b = np.asarray(b)
-        return float(np.mean(np.abs(a - b)))
-
-    rmse_steps: List[float] = []
-    mae_steps: List[float] = []
-    cov_steps: List[float] = []
-    for h in range(y_true.shape[1]):
-        price_true = to_price_from_target(c0, y_true[:, h], target_type)
-        price_pred = to_price_from_target(c0, yhat[:, h], target_type)
-        rmse_steps.append(rmse(price_true, price_pred))
-        mae_steps.append(mae(price_true, price_pred))
-        lo = q_pred[:, h, 0]
-        hi = q_pred[:, h, -1]
-        cov_steps.append(float(np.mean((y_true[:, h] >= lo) & (y_true[:, h] <= hi))))
-
-    metrics = {
-        "val_rmse_h1_price": rmse(price_true_h1, price_pred_h1),
-        "val_mae_h1_price": mae(price_true_h1, price_pred_h1),
-        "val_rmse_avg_steps": float(np.mean(rmse_steps)),
-        "val_mae_avg_steps": float(np.mean(mae_steps)),
-        "val_cov_avg_steps": float(np.mean(cov_steps)),
-    }
+    summary = _compute_metric_summary(y_true, q_pred, c0, target_type, quantiles)
+    metrics = {f"val_{k}": float(v) for k, v in summary["metrics"].items()}
     detail = {
-        "rmse_steps": [float(v) for v in rmse_steps],
-        "mae_steps": [float(v) for v in mae_steps],
-        "coverage_steps": [float(v) for v in cov_steps],
+        "rmse_steps_price": summary["rmse_steps_price"],
+        "mae_steps_price": summary["mae_steps_price"],
+        "rel_rmse_steps": summary["rel_rmse_steps"],
+        "rel_mae_steps": summary["rel_mae_steps"],
+        "log_rmse_steps": summary["log_rmse_steps"],
+        "log_mae_steps": summary["log_mae_steps"],
+        "coverage_steps": summary["coverage_steps"],
     }
     return metrics, detail
 
 
 def _compute_diagnostics(y_true: np.ndarray, q_pred: np.ndarray, c0: np.ndarray,
-                         target_type: str, quantiles: List[float]) -> Dict[str, object]:
-    q_index = quantiles.index(0.5) if 0.5 in quantiles else len(quantiles) // 2
-    yhat = q_pred[..., q_index]
-    price_true_h1 = to_price_from_target(c0, y_true[:, 0], target_type)
-    price_pred_h1 = to_price_from_target(c0, yhat[:, 0], target_type)
+                         target_type: str, quantiles: List[float],
+                         dates: Optional[pd.Series] = None) -> Dict[str, object]:
+    summary = _compute_metric_summary(y_true, q_pred, c0, target_type, quantiles)
 
-    def rmse(a, b):
-        a = np.asarray(a); b = np.asarray(b)
-        return float(np.sqrt(np.mean((a - b) ** 2)))
+    segments: Dict[str, Dict[str, object]] = {}
+    seg_cfgs = getattr(config, "EVAL_SEGMENTS", [])
+    for seg in seg_cfgs:
+        name = seg.get("name") or "segment"
+        idx = _segment_indices(dates, seg)
+        if idx.size == 0:
+            continue
+        seg_summary = _compute_metric_summary(y_true[idx], q_pred[idx], c0[idx], target_type, quantiles)
+        segments[name] = {
+            "count": int(idx.size),
+            "metrics": {k: float(v) for k, v in seg_summary["metrics"].items()},
+        }
 
-    def mae(a, b):
-        a = np.asarray(a); b = np.asarray(b)
-        return float(np.mean(np.abs(a - b)))
-
-    rmse_steps: List[float] = []
-    mae_steps: List[float] = []
-    cov_steps: List[float] = []
-    for h in range(y_true.shape[1]):
-        price_true = to_price_from_target(c0, y_true[:, h], target_type)
-        price_pred = to_price_from_target(c0, yhat[:, h], target_type)
-        rmse_steps.append(rmse(price_true, price_pred))
-        mae_steps.append(mae(price_true, price_pred))
-        lo = q_pred[:, h, 0]
-        hi = q_pred[:, h, -1]
-        cov_steps.append(float(np.mean((y_true[:, h] >= lo) & (y_true[:, h] <= hi))))
-
-    metrics = {
-        "rmse_h1_price": rmse(price_true_h1, price_pred_h1),
-        "mae_h1_price": mae(price_true_h1, price_pred_h1),
-        "rmse_avg_steps": float(np.mean(rmse_steps)),
-        "mae_avg_steps": float(np.mean(mae_steps)),
-        "coverage_avg_steps": float(np.mean(cov_steps)),
-    }
-    return {
-        "yhat": yhat,
-        "price_true_h1": price_true_h1,
-        "price_pred_h1": price_pred_h1,
-        "rmse_steps": rmse_steps,
-        "mae_steps": mae_steps,
-        "coverage_steps": cov_steps,
-        "metrics": metrics,
-    }
+    summary["price_true_h1"] = summary["price_true_steps"][:, 0]
+    summary["price_pred_h1"] = summary["price_pred_steps"][:, 0]
+    summary["segments"] = segments
+    return summary
 
 
 def run_time_series_cv(base_cfg: TFTCfg,
@@ -513,22 +557,21 @@ def main():
     _ensure_finite("val_quantiles", q_va)
     _ensure_finite("test_quantiles", q_te)
 
-    val_diag = _compute_diagnostics(va_seq.y, q_va, va_seq.c0, config.PRED_TARGET, config.QUANTILES)
-    test_diag = _compute_diagnostics(te_seq.y, q_te, te_seq.c0, config.PRED_TARGET, config.QUANTILES)
+    val_diag = _compute_diagnostics(va_seq.y, q_va, va_seq.c0, config.PRED_TARGET, config.QUANTILES, dates=va_seq.dates_fut)
+    test_diag = _compute_diagnostics(te_seq.y, q_te, te_seq.c0, config.PRED_TARGET, config.QUANTILES, dates=te_seq.dates_fut)
 
-    metrics = {
-        "val_rmse_h1_price": val_diag["metrics"]["rmse_h1_price"],
-        "val_mae_h1_price": val_diag["metrics"]["mae_h1_price"],
-        "val_rmse_avg_steps": val_diag["metrics"]["rmse_avg_steps"],
-        "val_mae_avg_steps": val_diag["metrics"]["mae_avg_steps"],
-        "val_cov_avg_steps": val_diag["metrics"]["coverage_avg_steps"],
-        "test_rmse_h1_price": test_diag["metrics"]["rmse_h1_price"],
-        "test_mae_h1_price": test_diag["metrics"]["mae_h1_price"],
-        "test_rmse_avg_steps": test_diag["metrics"]["rmse_avg_steps"],
-        "test_mae_avg_steps": test_diag["metrics"]["mae_avg_steps"],
-        "test_cov_avg_steps": test_diag["metrics"]["coverage_avg_steps"],
-    }
-    metrics = {k: float(v) for k, v in metrics.items()}
+    metrics_flat: Dict[str, object] = {}
+    for split_name, diag in ("val", val_diag), ("test", test_diag):
+        for key, value in diag["metrics"].items():
+            metrics_flat[f"{split_name}_{key}"] = float(value)
+
+    segments_payload: Dict[str, Dict[str, object]] = {}
+    if val_diag.get("segments"):
+        segments_payload["val"] = val_diag["segments"]
+    if test_diag.get("segments"):
+        segments_payload["test"] = test_diag["segments"]
+    if segments_payload:
+        metrics_flat["segments"] = segments_payload
 
     run_dir = create_next_run_dir(config.OUT_DIR)
     (run_dir / "pred").mkdir(parents=True, exist_ok=True)
@@ -537,7 +580,7 @@ def main():
     np.save(run_dir / "pred/val_quantiles.npy", q_va)
     np.save(run_dir / "pred/test_quantiles.npy", q_te)
     with (run_dir / "metrics.json").open("w", encoding="utf-8") as f:
-        json.dump(metrics, f, ensure_ascii=False, indent=2)
+        json.dump(metrics_flat, f, ensure_ascii=False, indent=2)
 
     if cv_summary:
         with (run_dir / "cv_summary.json").open("w", encoding="utf-8") as f:
@@ -572,12 +615,12 @@ def main():
     price_pred_te_last = to_price_from_target(te_seq.c0, test_diag["yhat"][:, h_last], config.PRED_TARGET)
     plot_step_series(te_seq.dates_fut, price_true_te_last, price_pred_te_last, h_last + 1, "TEST Price", run_dir / "figs/test_price_hLast.png")
 
-    np.save(run_dir / "pred/val_rmse_steps.npy", np.array(val_diag["rmse_steps"]))
-    np.save(run_dir / "pred/test_rmse_steps.npy", np.array(test_diag["rmse_steps"]))
+    np.save(run_dir / "pred/val_rmse_steps.npy", np.array(val_diag["rmse_steps_price"]))
+    np.save(run_dir / "pred/test_rmse_steps.npy", np.array(test_diag["rmse_steps_price"]))
     np.save(run_dir / "pred/val_cov_steps.npy", np.array(val_diag["coverage_steps"]))
     np.save(run_dir / "pred/test_cov_steps.npy", np.array(test_diag["coverage_steps"]))
-    plot_step_metric(np.array(val_diag["rmse_steps"]), "VAL RMSE per step (price)", run_dir / "figs/val_rmse_steps.png")
-    plot_step_metric(np.array(test_diag["rmse_steps"]), "TEST RMSE per step (price)", run_dir / "figs/test_rmse_steps.png")
+    plot_step_metric(np.array(val_diag["rmse_steps_price"]), "VAL RMSE per step (price)", run_dir / "figs/val_rmse_steps.png")
+    plot_step_metric(np.array(test_diag["rmse_steps_price"]), "TEST RMSE per step (price)", run_dir / "figs/test_rmse_steps.png")
     plot_bar(np.array(val_diag["coverage_steps"]), "VAL Coverage q10–q90 (target)", run_dir / "figs/val_coverage.png", ylabel='coverage')
     plot_bar(np.array(test_diag["coverage_steps"]), "TEST Coverage q10–q90 (target)", run_dir / "figs/test_coverage.png", ylabel='coverage')
 
