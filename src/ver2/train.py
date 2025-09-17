@@ -16,6 +16,13 @@ from .utils import create_next_run_dir
 from .data import load_raw, build_feature_frame, split_by_date, make_sequences, SeqData
 from .model_tft import TFTCfg, TFTMultiHQuantile, train_one, predict
 from .plots import plot_price_series, plot_step_series, plot_quantile_band, plot_step_metric, plot_bar
+from .insights import (
+    save_variable_weights,
+    save_attn_weights,
+    plot_variable_bar,
+    plot_time_heatmap,
+    plot_attention_heatmap,
+)
 
 
 def _ensure_finite(name: str, arr: np.ndarray) -> None:
@@ -53,6 +60,56 @@ def to_price_from_target(c0: np.ndarray, y: np.ndarray, target_type: str) -> np.
     if np.asarray(y).ndim == 1:
         return prices[:, 0]
     return prices
+
+
+def _summarize_weights(w: Optional[np.ndarray], feature_names: List[str]) -> Optional[Dict[str, object]]:
+    if w is None:
+        return None
+    w = np.asarray(w, dtype=float)
+    if w.ndim < 2:
+        w = w.reshape(1, -1)
+    mean = w.mean(axis=tuple(range(w.ndim - 1)))
+    time_mean = w.mean(axis=0)
+    feature_names = list(feature_names)
+    if len(feature_names) != mean.shape[-1]:
+        feature_names = [f"f{i}" for i in range(mean.shape[-1])]
+    order = np.argsort(-mean)
+    top_features = [{"name": feature_names[i], "weight": float(mean[i])} for i in order[:10]]
+    return {
+        "feature_names": feature_names,
+        "mean": mean.tolist(),
+        "time_mean": np.squeeze(time_mean).tolist() if time_mean.ndim > 1 else time_mean.tolist(),
+        "top_features": top_features,
+    }
+
+
+def _summarize_tft_details(details: Dict[str, object], feat_names: Dict[str, List[str]]) -> Dict[str, object]:
+    summary: Dict[str, object] = {}
+    w_obs = details.get("w_obs")
+    w_kn = details.get("w_kn")
+    w_st = details.get("w_st")
+    attn = details.get("attn")
+
+    if w_obs is not None:
+        obs_summary = _summarize_weights(w_obs, feat_names.get("obs", []))
+        if obs_summary:
+            summary["observed"] = obs_summary
+    if w_kn is not None:
+        kn_summary = _summarize_weights(w_kn, feat_names.get("known", []))
+        if kn_summary:
+            summary["known"] = kn_summary
+    if w_st is not None:
+        st_summary = _summarize_weights(w_st, feat_names.get("static", []))
+        if st_summary:
+            summary["static"] = st_summary
+    if attn is not None:
+        attn = np.asarray(attn, dtype=float)
+        attn_mean = attn.mean(axis=0)
+        summary["attention"] = {
+            "mean": attn_mean.tolist(),
+            "shape": list(attn_mean.shape),
+        }
+    return summary
 
 
 def _fit_scalers(Xo: np.ndarray, Xk: np.ndarray, Xs: np.ndarray, y: np.ndarray) -> Dict[str, np.ndarray]:
@@ -578,6 +635,9 @@ def main():
     val_diag = _compute_diagnostics(va_seq.y, q_va, va_seq.c0, target_type, config.QUANTILES, dates=va_seq.dates_fut)
     test_diag = _compute_diagnostics(te_seq.y, q_te, te_seq.c0, target_type, config.QUANTILES, dates=te_seq.dates_fut)
 
+    val_tft_summary = _summarize_tft_details(det_va, va_seq.feat_names)
+    test_tft_summary = _summarize_tft_details(det_te, te_seq.feat_names)
+
     metrics_flat: Dict[str, object] = {}
     for split_name, diag in ("val", val_diag), ("test", test_diag):
         for key, value in diag["metrics"].items():
@@ -599,6 +659,79 @@ def main():
     np.save(run_dir / "pred/test_quantiles.npy", q_te)
     with (run_dir / "metrics.json").open("w", encoding="utf-8") as f:
         json.dump(metrics_flat, f, ensure_ascii=False, indent=2)
+
+    insights_base = run_dir / "pred"
+    if val_tft_summary:
+        with (insights_base / "val_tft_summary.json").open("w", encoding="utf-8") as f:
+            json.dump(val_tft_summary, f, ensure_ascii=False, indent=2)
+        obs = val_tft_summary.get("observed")
+        if obs:
+            save_variable_weights(insights_base, "val_observed", obs)
+            plot_variable_bar(obs["feature_names"], np.asarray(obs["mean"], dtype=float),
+                              "Observed Variable Importance (VAL)",
+                              run_dir / "figs/val_var_obs_top20.png")
+            plot_time_heatmap(np.asarray(obs["time_mean"], dtype=float),
+                              "Observed Variable Weights Over Time (VAL)",
+                              run_dir / "figs/val_var_obs_time.png",
+                              ylabel="Feature")
+        kn = val_tft_summary.get("known")
+        if kn:
+            save_variable_weights(insights_base, "val_known", kn)
+            plot_variable_bar(kn["feature_names"], np.asarray(kn["mean"], dtype=float),
+                              "Known Variable Importance (VAL)",
+                              run_dir / "figs/val_var_known_top20.png")
+            plot_time_heatmap(np.asarray(kn["time_mean"], dtype=float),
+                              "Known Variable Weights Over Time (VAL)",
+                              run_dir / "figs/val_var_known_time.png",
+                              ylabel="Feature")
+        st = val_tft_summary.get("static")
+        if st:
+            save_variable_weights(insights_base, "val_static", st)
+            plot_variable_bar(st["feature_names"], np.asarray(st["mean"], dtype=float),
+                              "Static Variable Importance (VAL)",
+                              run_dir / "figs/val_var_static.png", top_k=len(st["feature_names"]))
+        attn = val_tft_summary.get("attention")
+        if attn:
+            save_attn_weights(insights_base, "val", attn)
+            plot_attention_heatmap(np.asarray(attn["mean"], dtype=float),
+                                   "Temporal Attention (VAL)",
+                                   run_dir / "figs/val_attention.png")
+
+    if test_tft_summary:
+        with (insights_base / "test_tft_summary.json").open("w", encoding="utf-8") as f:
+            json.dump(test_tft_summary, f, ensure_ascii=False, indent=2)
+        obs = test_tft_summary.get("observed")
+        if obs:
+            save_variable_weights(insights_base, "test_observed", obs)
+            plot_variable_bar(obs["feature_names"], np.asarray(obs["mean"], dtype=float),
+                              "Observed Variable Importance (TEST)",
+                              run_dir / "figs/test_var_obs_top20.png")
+            plot_time_heatmap(np.asarray(obs["time_mean"], dtype=float),
+                              "Observed Variable Weights Over Time (TEST)",
+                              run_dir / "figs/test_var_obs_time.png",
+                              ylabel="Feature")
+        kn = test_tft_summary.get("known")
+        if kn:
+            save_variable_weights(insights_base, "test_known", kn)
+            plot_variable_bar(kn["feature_names"], np.asarray(kn["mean"], dtype=float),
+                              "Known Variable Importance (TEST)",
+                              run_dir / "figs/test_var_known_top20.png")
+            plot_time_heatmap(np.asarray(kn["time_mean"], dtype=float),
+                              "Known Variable Weights Over Time (TEST)",
+                              run_dir / "figs/test_var_known_time.png",
+                              ylabel="Feature")
+        st = test_tft_summary.get("static")
+        if st:
+            save_variable_weights(insights_base, "test_static", st)
+            plot_variable_bar(st["feature_names"], np.asarray(st["mean"], dtype=float),
+                              "Static Variable Importance (TEST)",
+                              run_dir / "figs/test_var_static.png", top_k=len(st["feature_names"]))
+        attn = test_tft_summary.get("attention")
+        if attn:
+            save_attn_weights(insights_base, "test", attn)
+            plot_attention_heatmap(np.asarray(attn["mean"], dtype=float),
+                                   "Temporal Attention (TEST)",
+                                   run_dir / "figs/test_attention.png")
 
     if cv_summary:
         with (run_dir / "cv_summary.json").open("w", encoding="utf-8") as f:
