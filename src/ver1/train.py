@@ -27,6 +27,7 @@ from .models.nn import NNConfig, fit_predict_seq
 from .models.tft import TFTConfig, TFTModel
 from .utils.run_dir import create_next_run_dir
 from .report import plots as rpt
+from device import get_torch_device, device_as_str
 import json
 
 
@@ -164,10 +165,14 @@ def fit_and_eval(cfg: TrainConfig, run_dir: Optional[Path] = None) -> Dict[str, 
         va_seq_Xs = fit_transform_seq(va_seq_X)
         te_seq_Xs = fit_transform_seq(te_seq_X)
 
+        torch_device = get_torch_device()
+        device_name = device_as_str(torch_device)
+        print(f"Using torch device: {device_name}")
+
         if model_name == "tft":
             tft_cfg = TFTConfig(num_vars=F, d_model=cfg.hidden_size, d_hidden=max(2*cfg.hidden_size, 64),
                                 nhead=min(4, cfg.hidden_size//8 if cfg.hidden_size>=8 else 1),
-                                dropout=0.1, epochs=cfg.epochs, batch_size=cfg.batch_size, lr=cfg.lr, device="cpu")
+                                dropout=0.1, epochs=cfg.epochs, batch_size=cfg.batch_size, lr=cfg.lr, device=device_name)
             tft = TFTModel(tft_cfg)
             out = tft.fit_predict(tr_seq_Xs, tr_seq_y, va_seq_Xs, va_seq_y, te_seq_Xs, return_details=True)
             pred_va, pred_te, tft_details = out
@@ -175,7 +180,7 @@ def fit_and_eval(cfg: TrainConfig, run_dir: Optional[Path] = None) -> Dict[str, 
             nn_cfg = NNConfig(model=model_name, input_size=F, hidden_size=cfg.hidden_size,
                               num_layers=2, dropout=0.1, d_model=cfg.hidden_size, nhead=4,
                               epochs=cfg.epochs, batch_size=cfg.batch_size, lr=cfg.lr,
-                              device="cpu")
+                              device=device_name)
             pred_va, pred_te = fit_predict_seq(nn_cfg, tr_seq_Xs, tr_seq_y, va_seq_Xs, va_seq_y, te_seq_Xs)
 
         # dates 使用序列末端时间步对应的 dva/dte（已由 build_sequences 返回）

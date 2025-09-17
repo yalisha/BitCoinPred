@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Union
 
 import numpy as np
 import torch
@@ -14,6 +14,14 @@ import math
 
 def _to_t(x: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(x.astype(np.float32))
+
+
+def _resolve_device(device: Union[str, torch.device, None]) -> torch.device:
+    if isinstance(device, torch.device):
+        return device
+    if device is None:
+        return torch.device("cpu")
+    return torch.device(device)
 
 
 class GLU(nn.Module):
@@ -74,6 +82,9 @@ class TFTCfg:
     d_hidden: int = 128
     nhead: int = 4
     dropout: float = 0.1
+    lstm_layers: int = 1
+    attn_dropout: float = 0.1
+    ff_dropout: float = 0.1
     horizon: int = 14
     quantiles: List[float] = None
     device: str = "cpu"
@@ -87,16 +98,26 @@ class TFTMultiHQuantile(nn.Module):
         self.vsn_kn  = VSN(num_kn,  cfg.d_model, cfg.d_hidden, time_distributed=True)
         self.vsn_st  = VSN(num_static, cfg.d_model, cfg.d_hidden, time_distributed=False)
 
-        self.enc_lstm = nn.LSTM(cfg.d_model, cfg.d_model, batch_first=True)
-        self.dec_lstm = nn.LSTM(cfg.d_model, cfg.d_model, batch_first=True)
+        lstm_dropout = cfg.dropout if cfg.lstm_layers > 1 else 0.0
+        self.enc_lstm = nn.LSTM(cfg.d_model, cfg.d_model, cfg.lstm_layers, batch_first=True, dropout=lstm_dropout)
+        self.dec_lstm = nn.LSTM(cfg.d_model, cfg.d_model, cfg.lstm_layers, batch_first=True, dropout=lstm_dropout)
 
-        self.attn_norm = nn.LayerNorm(cfg.d_model)
-        self.cross_attn = nn.MultiheadAttention(cfg.d_model, cfg.nhead, batch_first=True, dropout=cfg.dropout)
+        self.static_enrich = GRN(cfg.d_model, cfg.d_hidden, cfg.d_model, dropout=cfg.dropout)
+        self.static_state_h = GRN(cfg.d_model, cfg.d_hidden, cfg.d_model, dropout=cfg.dropout)
+        self.static_state_c = GRN(cfg.d_model, cfg.d_hidden, cfg.d_model, dropout=cfg.dropout)
+        self.static_temporal_gate = nn.Linear(cfg.d_model, cfg.d_model)
+        self.static_fusion_gate = nn.Linear(cfg.d_model, cfg.d_model)
+
+        self.pre_attn_norm = nn.LayerNorm(cfg.d_model)
+        self.cross_attn = nn.MultiheadAttention(cfg.d_model, cfg.nhead, batch_first=True, dropout=cfg.attn_dropout)
+        self.attn_dropout = nn.Dropout(cfg.attn_dropout)
         self.attn_glu  = GLU(cfg.d_model)
-        self.out_norm  = nn.LayerNorm(cfg.d_model)
+        self.attn_post_norm  = nn.LayerNorm(cfg.d_model)
+
+        self.fusion_grn = GRN(cfg.d_model, cfg.d_hidden, cfg.d_model, dropout=cfg.ff_dropout)
+        self.fusion_norm = nn.LayerNorm(cfg.d_model)
 
         Q = len(cfg.quantiles)
-        H = cfg.horizon
         self.head = nn.Linear(cfg.d_model, Q)
 
     def forward(self, X_obs, X_kn, X_static):
@@ -105,20 +126,46 @@ class TFTMultiHQuantile(nn.Module):
         z_kn,  w_kn  = self.vsn_kn(X_kn)
         z_st,  w_st  = self.vsn_st(X_static.unsqueeze(1))  # [B,1,D]
 
-        enc_out, (h, c) = self.enc_lstm(z_obs)
-        # 将静态上下文注入decoder初始状态（简化：线性投影叠加）
-        dec_in = z_kn
+        static_context = self.static_enrich(z_st)  # [B,1,D]
+        context_vec = static_context.squeeze(1)
+        z_obs = z_obs + static_context
+        dec_in = z_kn + static_context
+
+        h_init = self.static_state_h(z_st).squeeze(1)
+        c_init = self.static_state_c(z_st).squeeze(1)
+        num_layers = self.enc_lstm.num_layers
+        h0 = h_init.unsqueeze(0).repeat(num_layers, 1, 1)
+        c0 = c_init.unsqueeze(0).repeat(num_layers, 1, 1)
+
+        enc_out, (h, c) = self.enc_lstm(z_obs, (h0, c0))
         dec_out, _ = self.dec_lstm(dec_in, (h, c))
 
         # Cross-attention: queries=dec_out, keys/values=enc_out
-        q = self.attn_norm(dec_out)
+        q = self.pre_attn_norm(dec_out)
         attn_out, attn_w = self.cross_attn(q, enc_out, enc_out)
+        attn_out = self.attn_dropout(attn_out)
+        temporal_gate = torch.sigmoid(self.static_temporal_gate(context_vec)).unsqueeze(1)
+        attn_out = attn_out * temporal_gate
         attn_out = self.attn_glu(attn_out)
-        h = self.out_norm(dec_out + attn_out)
+        attn_res = self.attn_post_norm(dec_out + attn_out)
+
+        fusion = self.fusion_grn(attn_res)
+        fusion_gate = torch.sigmoid(self.static_fusion_gate(context_vec)).unsqueeze(1)
+        fusion = fusion * fusion_gate
+        h = self.fusion_norm(attn_res + fusion)
         q_pred = self.head(h)  # [B, H, Q]
         # 防止分位交叉：按最后维排序
         q_pred_sorted, _ = torch.sort(q_pred, dim=-1)
-        return q_pred_sorted, {"w_obs": w_obs, "w_kn": w_kn, "w_st": w_st, "attn": attn_w}
+        details = {
+            "w_obs": w_obs,
+            "w_kn": w_kn,
+            "w_st": w_st,
+            "attn": attn_w,
+            "static_context": context_vec,
+            "temporal_gate": temporal_gate,
+            "fusion_gate": fusion_gate,
+        }
+        return q_pred_sorted, details
 
 
 def pinball_loss(y_true: torch.Tensor, y_pred_q: torch.Tensor, quantiles: List[float], step_weights: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -142,13 +189,14 @@ def train_one(cfg: TFTCfg,
               tr: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
               va: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
               epochs: int = 20, lr: float = 1e-3, batch_size: int = 128,
-              device: str = "cpu",
+              device: Union[str, torch.device] = "cpu",
               step_weights_np: Optional[np.ndarray] = None,
               mse_aux_weight: float = 0.1,
               grad_clip_norm: float = 1.0):
     Xo_tr, Xk_tr, Xs_tr, y_tr = tr
     Xo_va, Xk_va, Xs_va, y_va = va
-    model.to(device)
+    torch_device = _resolve_device(device)
+    model.to(torch_device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     # Some torch versions don't support 'verbose' arg; omit for compatibility
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=2)
@@ -165,10 +213,10 @@ def train_one(cfg: TFTCfg,
             sel = idx[i:i+batch_size]
             yield (
                 sel,
-                _to_t(Xo[sel]).to(device),
-                _to_t(Xk[sel]).to(device),
-                _to_t(Xs[sel]).to(device),
-                _to_t(y[sel]).to(device),
+                _to_t(Xo[sel]).to(torch_device),
+                _to_t(Xk[sel]).to(torch_device),
+                _to_t(Xs[sel]).to(torch_device),
+                _to_t(y[sel]).to(torch_device),
             )
 
     def describe_tensor(t: torch.Tensor) -> dict:
@@ -195,7 +243,7 @@ def train_one(cfg: TFTCfg,
     mse_aux_weight = float(mse_aux_weight)
     step_weights_t = None
     if step_weights_np is not None:
-        step_weights_t = torch.from_numpy(step_weights_np.astype(np.float32)).to(device)
+        step_weights_t = torch.from_numpy(step_weights_np.astype(np.float32)).to(torch_device)
 
     for ep in range(epochs):
         model.train()
@@ -241,10 +289,10 @@ def train_one(cfg: TFTCfg,
         # val
         model.eval()
         with torch.no_grad():
-            Xo = _to_t(Xo_va).to(device)
-            Xk = _to_t(Xk_va).to(device)
-            Xs = _to_t(Xs_va).to(device)
-            y  = _to_t(y_va).to(device)
+            Xo = _to_t(Xo_va).to(torch_device)
+            Xk = _to_t(Xk_va).to(torch_device)
+            Xs = _to_t(Xs_va).to(torch_device)
+            y  = _to_t(y_va).to(torch_device)
             q_pred, _ = model(Xo, Xk, Xs)
             loss_pin = pinball_loss(y, q_pred, cfg.quantiles, step_weights=step_weights_t)
             if q_pred.shape[-1] > q_index:
@@ -285,11 +333,12 @@ def train_one(cfg: TFTCfg,
 
 def predict(model: TFTMultiHQuantile,
             Xo: np.ndarray, Xk: np.ndarray, Xs: np.ndarray,
-            device: str = "cpu") -> Tuple[np.ndarray, dict]:
+            device: Optional[Union[str, torch.device]] = None) -> Tuple[np.ndarray, dict]:
     model.eval()
+    torch_device = _resolve_device(device if device is not None else next(model.parameters()).device)
     with torch.no_grad():
-        Xo_t = _to_t(Xo).to(device)
-        Xk_t = _to_t(Xk).to(device)
-        Xs_t = _to_t(Xs).to(device)
+        Xo_t = _to_t(Xo).to(torch_device)
+        Xk_t = _to_t(Xk).to(torch_device)
+        Xs_t = _to_t(Xs).to(torch_device)
         q_pred, details = model(Xo_t, Xk_t, Xs_t)
     return q_pred.cpu().numpy(), {k: (v.cpu().numpy() if hasattr(v, 'cpu') else v) for k, v in details.items()}

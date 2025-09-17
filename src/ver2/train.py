@@ -10,6 +10,7 @@ from typing import Dict, List
 import json
 import numpy as np
 import pandas as pd
+from device import get_torch_device, device_as_str
 
 from . import config
 from .utils import create_next_run_dir
@@ -81,9 +82,23 @@ def main():
     y_va = (va_seq.y - y_mu) / y_sd
     y_te = (te_seq.y - y_mu) / y_sd
 
-    # 模型
-    cfg = TFTCfg(d_model=config.HIDDEN_SIZE, d_hidden=max(2*config.HIDDEN_SIZE,64), nhead=min(config.NHEAD, max(1, config.HIDDEN_SIZE//8)),
-                 dropout=config.DROPOUT, horizon=config.HORIZON, quantiles=config.QUANTILES, device='cpu')
+    # 模型/设备
+    torch_device = get_torch_device()
+    device_name = device_as_str(torch_device)
+    print(f"Using torch device: {device_name}")
+
+    cfg = TFTCfg(
+        d_model=config.HIDDEN_SIZE,
+        d_hidden=max(2*config.HIDDEN_SIZE, 64),
+        nhead=min(config.NHEAD, max(1, config.HIDDEN_SIZE//8)),
+        dropout=config.DROPOUT,
+        lstm_layers=config.LSTM_LAYERS,
+        attn_dropout=config.ATTN_DROPOUT,
+        ff_dropout=config.FF_DROPOUT,
+        horizon=config.HORIZON,
+        quantiles=config.QUANTILES,
+        device=device_name,
+    )
     model = TFTMultiHQuantile(num_obs=Xo_tr.shape[-1], num_kn=Xk_tr.shape[-1], num_static=Xs_tr.shape[-1], cfg=cfg)
 
     # 步长加权
@@ -99,13 +114,13 @@ def main():
     model = train_one(cfg, model,
                       (Xo_tr, Xk_tr, Xs_tr, y_tr),
                       (Xo_va, Xk_va, Xs_va, y_va),
-                      epochs=config.EPOCHS, lr=config.LR, batch_size=config.BATCH_SIZE, device='cpu',
+                      epochs=config.EPOCHS, lr=config.LR, batch_size=config.BATCH_SIZE, device=torch_device,
                       step_weights_np=step_w, mse_aux_weight=config.MSE_AUX_WEIGHT,
                       grad_clip_norm=config.GRAD_CLIP)
 
     # 预测
-    q_va_z, det_va = predict(model, Xo_va, Xk_va, Xs_va)
-    q_te_z, det_te = predict(model, Xo_te, Xk_te, Xs_te)
+    q_va_z, det_va = predict(model, Xo_va, Xk_va, Xs_va, device=torch_device)
+    q_te_z, det_te = predict(model, Xo_te, Xk_te, Xs_te, device=torch_device)
     # 反标准化回原始目标空间（按步长逐列，匹配 [N,H,Q]）
     y_mu3 = y_mu.reshape(1, y_mu.shape[1], 1)
     y_sd3 = y_sd.reshape(1, y_sd.shape[1], 1)

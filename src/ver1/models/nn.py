@@ -185,9 +185,10 @@ def fit_predict_seq(cfg: NNConfig,
     val_loader = _make_loader(Xva, yva, cfg.batch_size, shuffle=False)
     _train_loop(net, train_loader, val_loader, epochs=cfg.epochs, lr=cfg.lr, patience=5, device=cfg.device)
 
+    device = torch.device(cfg.device)
+    net.to(device)
     net.eval()
     with torch.no_grad():
-        pred_va = net(_to_tensor(Xva)).squeeze(1).numpy()
-        pred_te = net(_to_tensor(Xte)).squeeze(1).numpy()
+        pred_va = net(_to_tensor(Xva).to(device)).squeeze(1).cpu().numpy()
+        pred_te = net(_to_tensor(Xte).to(device)).squeeze(1).cpu().numpy()
     return pred_va, pred_te
-
