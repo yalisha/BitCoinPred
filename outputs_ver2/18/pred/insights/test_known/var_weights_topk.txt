@@ -1,0 +1,10 @@
+kn_anchor_logc0_lag7	0.675990
+kn_event_dom_12	0.030021
+kn_event_dom_1	0.029959
+kn_event_dom_20	0.029529
+kn_event_dom_10	0.029358
+kn_event_dom_15	0.029292
+kn_event_dom_25	0.028612
+kn_doy	0.014663
+kn_is_weekend	0.013263
+kn_event_halving4	0.009099

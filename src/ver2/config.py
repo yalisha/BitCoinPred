@@ -57,7 +57,7 @@ EVAL_SEGMENTS = [
 ]
 
 # 超参搜索（Optuna）
-ENABLE_OPTUNA = False
+ENABLE_OPTUNA = True
 OPTUNA_TRIALS = 20
 OPTUNA_TIMEOUT = 1800  # 秒，0 表示不限
 OPTUNA_STUDY = "tft_ver2"
