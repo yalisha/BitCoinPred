@@ -315,6 +315,7 @@ def run_time_series_cv(base_cfg: TFTCfg,
             mse_aux_weight=float(train_params.get("mse_aux_weight", config.MSE_AUX_WEIGHT)),
             grad_clip_norm=float(train_params.get("grad_clip", config.GRAD_CLIP)),
             weight_decay=float(train_params.get("weight_decay", config.WEIGHT_DECAY)),
+            temporal_smooth_weight=float(train_params.get("temporal_smooth_weight", config.TEMPORAL_SMOOTHING_WEIGHT)),
         )
 
         q_va_z, _ = predict(model, Xo_va, Xk_va, Xs_va, device=device)
@@ -416,6 +417,7 @@ def run_optuna_study(base_cfg: TFTCfg,
             "mse_aux_weight": mse_aux,
             "batch_size": batch_size,
             "cv_folds": max(2, min(train_params.get("cv_folds", config.CV_FOLDS), 3)),
+            "temporal_smooth_weight": config.TEMPORAL_SMOOTHING_WEIGHT,
         })
 
         cv_result = run_time_series_cv(
@@ -522,6 +524,7 @@ def main():
             "weight_decay": config.WEIGHT_DECAY,
             "cv_folds": config.CV_FOLDS,
             "min_train": config.CV_MIN_TRAIN_SAMPLES,
+            "temporal_smooth_weight": config.TEMPORAL_SMOOTHING_WEIGHT,
         }
         cv_summary = run_time_series_cv(cfg, cv_seq, step_w, torch_device, cv_params, target_type, config.QUANTILES, val_window_len, verbose=True)
 
@@ -536,6 +539,7 @@ def main():
             "weight_decay": config.WEIGHT_DECAY,
             "cv_folds": config.CV_FOLDS,
             "min_train": config.CV_MIN_TRAIN_SAMPLES,
+            "temporal_smooth_weight": config.TEMPORAL_SMOOTHING_WEIGHT,
         }
         optuna_summary = run_optuna_study(cfg, cv_seq, step_w, torch_device, optuna_params, target_type, config.QUANTILES, val_window_len)
         if optuna_summary and optuna_summary.get("best_params"):
@@ -561,6 +565,7 @@ def main():
         mse_aux_weight=config.MSE_AUX_WEIGHT,
         grad_clip_norm=config.GRAD_CLIP,
         weight_decay=config.WEIGHT_DECAY,
+        temporal_smooth_weight=config.TEMPORAL_SMOOTHING_WEIGHT,
     )
 
     q_va_z, det_va = predict(model, Xo_va, Xk_va, Xs_va, device=torch_device)

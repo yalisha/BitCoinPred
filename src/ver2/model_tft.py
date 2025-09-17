@@ -193,7 +193,8 @@ def train_one(cfg: TFTCfg,
               step_weights_np: Optional[np.ndarray] = None,
               mse_aux_weight: float = 0.1,
               grad_clip_norm: float = 1.0,
-              weight_decay: float = 0.0):
+              weight_decay: float = 0.0,
+              temporal_smooth_weight: float = 0.0):
     Xo_tr, Xk_tr, Xs_tr, y_tr = tr
     Xo_va, Xk_va, Xs_va, y_va = va
     torch_device = _resolve_device(device)
@@ -264,6 +265,12 @@ def train_one(cfg: TFTCfg,
                 loss = loss_pin + mse_aux_weight * loss_mse
             else:
                 loss = loss_pin
+            if temporal_smooth_weight > 0.0 and q_pred.shape[1] > 1:
+                q50 = q_pred[..., q_index] if q_pred.shape[-1] > q_index else q_pred[..., -1]
+                q50_diff = q50[:, 1:] - q50[:, :-1]
+                y_diff = y[:, 1:] - y[:, :-1]
+                loss_diff = torch.mean((q50_diff - y_diff) ** 2)
+                loss = loss + temporal_smooth_weight * loss_diff
             if torch.isnan(loss) or torch.isinf(loss):
                 log_batch_issue("loss_nan", ep+1, batch_id, sel, Xo, Xk, Xs, y, q_pred=q_pred)
                 raise ValueError(f"NaN/Inf loss encountered at epoch {ep+1}")
@@ -299,9 +306,15 @@ def train_one(cfg: TFTCfg,
             if q_pred.shape[-1] > q_index:
                 q50 = q_pred[..., q_index]
                 loss_mse = torch.mean((q50 - y)**2)
-                va_loss = (loss_pin + mse_aux_weight * loss_mse).item()
+                loss_val = loss_pin + mse_aux_weight * loss_mse
             else:
-                va_loss = loss_pin.item()
+                loss_val = loss_pin
+            if temporal_smooth_weight > 0.0 and q_pred.shape[1] > 1:
+                q50 = q_pred[..., q_index] if q_pred.shape[-1] > q_index else q_pred[..., -1]
+                q50_diff = q50[:, 1:] - q50[:, :-1]
+                y_diff = y[:, 1:] - y[:, :-1]
+                loss_val = loss_val + temporal_smooth_weight * torch.mean((q50_diff - y_diff) ** 2)
+            va_loss = loss_val.item()
         if math.isnan(tr_loss) or math.isnan(va_loss) or math.isinf(tr_loss) or math.isinf(va_loss):
             raise ValueError(f"Non-finite epoch loss encountered at epoch {ep+1}")
 
