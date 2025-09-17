@@ -1,0 +1,56 @@
+{
+  "n_trials": 2,
+  "best_value": 851.3061061137298,
+  "best_params": {
+    "hidden_size": 192,
+    "nhead": 4,
+    "dropout": 0.1,
+    "attn_dropout": 0.15000000000000002,
+    "ff_dropout": 0.2,
+    "lstm_layers": 1,
+    "lr": 0.00023941422358782517,
+    "weight_decay": 0.00018006398399504463,
+    "grad_clip": 4.801422008297147,
+    "mse_aux_weight": 0.27927577477684773,
+    "batch_size": 16
+  },
+  "direction": "MINIMIZE",
+  "history": [
+    {
+      "number": 0,
+      "value": 851.3061061137298,
+      "params": {
+        "hidden_size": 192,
+        "nhead": 4,
+        "dropout": 0.1,
+        "attn_dropout": 0.15000000000000002,
+        "ff_dropout": 0.2,
+        "lstm_layers": 1,
+        "lr": 0.00023941422358782517,
+        "weight_decay": 0.00018006398399504463,
+        "grad_clip": 4.801422008297147,
+        "mse_aux_weight": 0.27927577477684773,
+        "batch_size": 16
+      },
+      "state": "COMPLETE"
+    },
+    {
+      "number": 1,
+      "value": 854.932178585511,
+      "params": {
+        "hidden_size": 64,
+        "nhead": 4,
+        "dropout": 0.35,
+        "attn_dropout": 0.3,
+        "ff_dropout": 0.05,
+        "lstm_layers": 1,
+        "lr": 0.00016717022316010583,
+        "weight_decay": 0.00021123625097829065,
+        "grad_clip": 3.774415886866245,
+        "mse_aux_weight": 0.2705159702484474,
+        "batch_size": 32
+      },
+      "state": "COMPLETE"
+    }
+  ]
+}

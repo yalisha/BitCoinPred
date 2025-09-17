@@ -14,6 +14,8 @@ DATA_CSV = BASE_DIR / "data" / "macro_btc_2014_2025_daily.csv"
 # // 继续预测价格，但使用“相对对数价格”作为目标：y_h = log(C_{t+h}) - log(C_t)
 # // 评估与可视化时将映射回价格：Ĉ_{t+h} = C_t * exp(ŷ_h)
 PRED_TARGET = "rel_logprice"  # price | logprice | logret | pctret | rel_logprice
+PREDICT_RETURNS = True        # 若为 True，则改为预测 RETURN_TARGET 指定的收益率
+RETURN_TARGET = "logret"      # 当 PREDICT_RETURNS=True 时使用的目标类型
 HORIZON = 5                    # 多步预测长度（天）
 SEQ_LEN = 60                   # 编码器序列长度（天）
 QUANTILES = [0.1, 0.5, 0.9]
@@ -27,7 +29,7 @@ OUT_DIR = BASE_DIR / "outputs_ver2"
 
 # 训练参数
 EPOCHS = 80
-BATCH_SIZE = 24
+BATCH_SIZE = 64
 HIDDEN_SIZE = 128
 LR = 3e-4
 DROPOUT = 0.2

@@ -25,19 +25,34 @@ def _ensure_finite(name: str, arr: np.ndarray) -> None:
         raise ValueError(f"Non-finite values detected in {name} at index {loc}")
 
 
-def to_price_from_target(c0: np.ndarray, y: np.ndarray, target_type: str) -> np.ndarray:
-    t = target_type.lower()
-    if t == 'price':
-        return y
-    if t == 'logprice':
-        return np.exp(y)
-    if t == 'rel_logprice':
-        return c0 * np.exp(y)
-    if t == 'logret':
-        return c0 * np.exp(y)
-    if t == 'pctret':
-        return c0 * (1.0 + y)
+def targets_to_price(c0: np.ndarray, y: np.ndarray, target_type: str) -> np.ndarray:
+    """Convert target space values to price trajectories for each horizon."""
+    target_type = target_type.lower()
+    y_arr = np.asarray(y, dtype=float)
+    if y_arr.ndim == 1:
+        y_arr = y_arr.reshape(-1, 1)
+    c0_arr = np.asarray(c0, dtype=float).reshape(-1, 1)
+
+    if target_type == 'price':
+        return y_arr
+    if target_type == 'logprice':
+        return np.exp(y_arr)
+    if target_type == 'rel_logprice':
+        return c0_arr * np.exp(y_arr)
+    if target_type == 'logret':
+        cum = np.cumsum(y_arr, axis=1)
+        return c0_arr * np.exp(cum)
+    if target_type == 'pctret':
+        cum = np.cumprod(1.0 + y_arr, axis=1)
+        return c0_arr * cum
     raise ValueError('unknown target_type')
+
+
+def to_price_from_target(c0: np.ndarray, y: np.ndarray, target_type: str) -> np.ndarray:
+    prices = targets_to_price(c0, y, target_type)
+    if np.asarray(y).ndim == 1:
+        return prices[:, 0]
+    return prices
 
 
 def _fit_scalers(Xo: np.ndarray, Xk: np.ndarray, Xs: np.ndarray, y: np.ndarray) -> Dict[str, np.ndarray]:
@@ -92,11 +107,8 @@ def _compute_metric_summary(y_true: np.ndarray,
     q_index = quantiles.index(0.5) if 0.5 in quantiles else len(quantiles) // 2
     yhat = q_pred[..., q_index]
 
-    price_true_steps = np.empty_like(y_true)
-    price_pred_steps = np.empty_like(yhat)
-    for h in range(y_true.shape[1]):
-        price_true_steps[:, h] = to_price_from_target(c0, y_true[:, h], target_type)
-        price_pred_steps[:, h] = to_price_from_target(c0, yhat[:, h], target_type)
+    price_true_steps = targets_to_price(c0, y_true, target_type)
+    price_pred_steps = targets_to_price(c0, yhat, target_type)
 
     diff_price = price_pred_steps - price_true_steps
     rmse_steps = np.sqrt(np.mean(diff_price ** 2, axis=0))
@@ -453,19 +465,20 @@ def run_optuna_study(base_cfg: TFTCfg,
 
 def main():
     raw = load_raw(config.DATA_CSV)
-    feat = build_feature_frame(raw, target_type=config.PRED_TARGET)
+    target_type = config.RETURN_TARGET if config.PREDICT_RETURNS else config.PRED_TARGET
+    feat = build_feature_frame(raw, target_type=target_type)
     parts = split_by_date(feat, config.TRAIN_END, config.VAL_END)
 
-    tr_seq = make_sequences(parts['train'], config.SEQ_LEN, config.HORIZON, config.PRED_TARGET)
-    va_seq = make_sequences(parts['val'],   config.SEQ_LEN, config.HORIZON, config.PRED_TARGET)
-    te_seq = make_sequences(parts['test'],  config.SEQ_LEN, config.HORIZON, config.PRED_TARGET)
+    tr_seq = make_sequences(parts['train'], config.SEQ_LEN, config.HORIZON, target_type)
+    va_seq = make_sequences(parts['val'],   config.SEQ_LEN, config.HORIZON, target_type)
+    te_seq = make_sequences(parts['test'],  config.SEQ_LEN, config.HORIZON, target_type)
 
     need_cv_seq = ((config.CV_ENABLED and config.CV_FOLDS >= 2) or config.ENABLE_OPTUNA)
     cv_seq: Optional[SeqData] = None
     if need_cv_seq:
         cv_df = pd.concat([parts['train'], parts['val']], ignore_index=True)
         cv_df = cv_df.sort_values('date').reset_index(drop=True)
-        cv_seq = make_sequences(cv_df, config.SEQ_LEN, config.HORIZON, config.PRED_TARGET)
+        cv_seq = make_sequences(cv_df, config.SEQ_LEN, config.HORIZON, target_type)
 
     # 步长加权
     if config.STEP_WEIGHT_MODE == 'linear':
@@ -510,7 +523,7 @@ def main():
             "cv_folds": config.CV_FOLDS,
             "min_train": config.CV_MIN_TRAIN_SAMPLES,
         }
-        cv_summary = run_time_series_cv(cfg, cv_seq, step_w, torch_device, cv_params, config.PRED_TARGET, config.QUANTILES, val_window_len, verbose=True)
+        cv_summary = run_time_series_cv(cfg, cv_seq, step_w, torch_device, cv_params, target_type, config.QUANTILES, val_window_len, verbose=True)
 
     optuna_summary = None
     if config.ENABLE_OPTUNA and cv_seq is not None:
@@ -524,7 +537,7 @@ def main():
             "cv_folds": config.CV_FOLDS,
             "min_train": config.CV_MIN_TRAIN_SAMPLES,
         }
-        optuna_summary = run_optuna_study(cfg, cv_seq, step_w, torch_device, optuna_params, config.PRED_TARGET, config.QUANTILES, val_window_len)
+        optuna_summary = run_optuna_study(cfg, cv_seq, step_w, torch_device, optuna_params, target_type, config.QUANTILES, val_window_len)
         if optuna_summary and optuna_summary.get("best_params"):
             print("Optuna 最佳参数:", optuna_summary["best_params"])
 
@@ -557,8 +570,8 @@ def main():
     _ensure_finite("val_quantiles", q_va)
     _ensure_finite("test_quantiles", q_te)
 
-    val_diag = _compute_diagnostics(va_seq.y, q_va, va_seq.c0, config.PRED_TARGET, config.QUANTILES, dates=va_seq.dates_fut)
-    test_diag = _compute_diagnostics(te_seq.y, q_te, te_seq.c0, config.PRED_TARGET, config.QUANTILES, dates=te_seq.dates_fut)
+    val_diag = _compute_diagnostics(va_seq.y, q_va, va_seq.c0, target_type, config.QUANTILES, dates=va_seq.dates_fut)
+    test_diag = _compute_diagnostics(te_seq.y, q_te, te_seq.c0, target_type, config.QUANTILES, dates=te_seq.dates_fut)
 
     metrics_flat: Dict[str, object] = {}
     for split_name, diag in ("val", val_diag), ("test", test_diag):
@@ -590,30 +603,31 @@ def main():
             json.dump(optuna_summary, f, ensure_ascii=False, indent=2)
 
     # 绘图：step=1 的价格时序对比 + 分位带（验证/测试）
-    plot_price_series(va_seq.dates_fut, val_diag["price_true_h1"], val_diag["price_pred_h1"], "VAL Price h=1 (q50)", run_dir / "figs/val_price_h1.png")
-    plot_price_series(te_seq.dates_fut, test_diag["price_true_h1"], test_diag["price_pred_h1"], "TEST Price h=1 (q50)", run_dir / "figs/test_price_h1.png")
+    price_true_va_steps = val_diag["price_true_steps"]
+    price_pred_va_steps = val_diag["price_pred_steps"]
+    price_true_te_steps = test_diag["price_true_steps"]
+    price_pred_te_steps = test_diag["price_pred_steps"]
+
+    plot_price_series(va_seq.dates_fut, price_true_va_steps[:, 0], price_pred_va_steps[:, 0], "VAL Price h=1 (q50)", run_dir / "figs/val_price_h1.png")
+    plot_price_series(te_seq.dates_fut, price_true_te_steps[:, 0], price_pred_te_steps[:, 0], "TEST Price h=1 (q50)", run_dir / "figs/test_price_h1.png")
 
     q_index = config.QUANTILES.index(0.5) if 0.5 in config.QUANTILES else len(config.QUANTILES) // 2
     ql_va, qm_va, qh_va = q_va[:, 0, 0], q_va[:, 0, q_index], q_va[:, 0, -1]
     ql_te, qm_te, qh_te = q_te[:, 0, 0], q_te[:, 0, q_index], q_te[:, 0, -1]
-    ql_p = to_price_from_target(va_seq.c0, ql_va, config.PRED_TARGET)
-    qm_p = to_price_from_target(va_seq.c0, qm_va, config.PRED_TARGET)
-    qh_p = to_price_from_target(va_seq.c0, qh_va, config.PRED_TARGET)
-    plot_quantile_band(va_seq.dates_fut, ql_p, qm_p, qh_p, "VAL Quantile band h=1", run_dir / "figs/val_band_h1.png")
+    ql_p = targets_to_price(va_seq.c0, ql_va, target_type)
+    qm_p = targets_to_price(va_seq.c0, qm_va, target_type)
+    qh_p = targets_to_price(va_seq.c0, qh_va, target_type)
+    plot_quantile_band(va_seq.dates_fut, ql_p[:, 0], qm_p[:, 0], qh_p[:, 0], "VAL Quantile band h=1", run_dir / "figs/val_band_h1.png")
 
-    ql_t = to_price_from_target(te_seq.c0, ql_te, config.PRED_TARGET)
-    qm_t = to_price_from_target(te_seq.c0, qm_te, config.PRED_TARGET)
-    qh_t = to_price_from_target(te_seq.c0, qh_te, config.PRED_TARGET)
-    plot_quantile_band(te_seq.dates_fut, ql_t, qm_t, qh_t, "TEST Quantile band h=1", run_dir / "figs/test_band_h1.png")
+    ql_t = targets_to_price(te_seq.c0, ql_te, target_type)
+    qm_t = targets_to_price(te_seq.c0, qm_te, target_type)
+    qh_t = targets_to_price(te_seq.c0, qh_te, target_type)
+    plot_quantile_band(te_seq.dates_fut, ql_t[:, 0], qm_t[:, 0], qh_t[:, 0], "TEST Quantile band h=1", run_dir / "figs/test_band_h1.png")
 
     h_last = config.HORIZON - 1
-    price_true_va_last = to_price_from_target(va_seq.c0, va_seq.y[:, h_last], config.PRED_TARGET)
-    price_pred_va_last = to_price_from_target(va_seq.c0, val_diag["yhat"][:, h_last], config.PRED_TARGET)
-    plot_step_series(va_seq.dates_fut, price_true_va_last, price_pred_va_last, h_last + 1, "VAL Price", run_dir / "figs/val_price_hLast.png")
+    plot_step_series(va_seq.dates_fut, price_true_va_steps[:, h_last], price_pred_va_steps[:, h_last], h_last + 1, "VAL Price", run_dir / "figs/val_price_hLast.png")
 
-    price_true_te_last = to_price_from_target(te_seq.c0, te_seq.y[:, h_last], config.PRED_TARGET)
-    price_pred_te_last = to_price_from_target(te_seq.c0, test_diag["yhat"][:, h_last], config.PRED_TARGET)
-    plot_step_series(te_seq.dates_fut, price_true_te_last, price_pred_te_last, h_last + 1, "TEST Price", run_dir / "figs/test_price_hLast.png")
+    plot_step_series(te_seq.dates_fut, price_true_te_steps[:, h_last], price_pred_te_steps[:, h_last], h_last + 1, "TEST Price", run_dir / "figs/test_price_hLast.png")
 
     np.save(run_dir / "pred/val_rmse_steps.npy", np.array(val_diag["rmse_steps_price"]))
     np.save(run_dir / "pred/test_rmse_steps.npy", np.array(test_diag["rmse_steps_price"]))
@@ -639,12 +653,11 @@ def main():
             yhat_te_med[:, h] = a_coef[-1] * yhat_te_med[:, h] + b_coef[-1]
         _ensure_finite("calibrated_q50_val", yhat_va_med)
         _ensure_finite("calibrated_q50_test", yhat_te_med)
-        test_rmse_steps_cal = []
-        for h in range(config.HORIZON):
-            test_rmse_steps_cal.append(float(np.sqrt(np.mean((to_price_from_target(te_seq.c0, te_seq.y[:, h], config.PRED_TARGET) -
-                                                              to_price_from_target(te_seq.c0, yhat_te_med[:, h], config.PRED_TARGET)) ** 2))))
-        np.save(run_dir / "pred/test_rmse_steps_calibrated.npy", np.array(test_rmse_steps_cal))
-        plot_step_metric(np.array(test_rmse_steps_cal), "TEST RMSE per step (calibrated)", run_dir / "figs/test_rmse_steps_calibrated.png")
+        true_price_cal = targets_to_price(te_seq.c0, te_seq.y, target_type)
+        pred_price_cal = targets_to_price(te_seq.c0, yhat_te_med, target_type)
+        test_rmse_steps_cal = np.sqrt(np.mean((true_price_cal - pred_price_cal) ** 2, axis=0))
+        np.save(run_dir / "pred/test_rmse_steps_calibrated.npy", test_rmse_steps_cal)
+        plot_step_metric(test_rmse_steps_cal, "TEST RMSE per step (calibrated)", run_dir / "figs/test_rmse_steps_calibrated.png")
         with (run_dir / "calibration_q50.json").open("w", encoding="utf-8") as f:
             json.dump({"a": a_coef, "b": b_coef}, f, ensure_ascii=False, indent=2)
 
