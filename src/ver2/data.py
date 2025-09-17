@@ -211,10 +211,16 @@ def make_sequences(df: pd.DataFrame, seq_len: int, horizon: int, target_type: st
         Xo = X_obs[t-T_enc+1: t+1]
         # 解码器窗口: 已知未来 [t+1, t+H]
         Xk = X_kn[t+1: t+1+T_dec]
-        # 将当前锚点 log(C_t) 作为已知未来的常量通道喂入解码器
-        logc0 = log_close[t]
-        anchor = np.full((T_dec, 1), logc0, dtype=float)
-        Xk = np.concatenate([Xk, anchor], axis=1)
+        # 可选：加入滞后 log 价格锚点
+        anchors = []
+        anchor_lag = getattr(config, "ANCHOR_LAG", None)
+        if anchor_lag is not None and anchor_lag >= 0:
+            lag_idx = max(0, t - int(anchor_lag))
+            logc_anchor = log_close[lag_idx]
+            anchors.append((f"kn_anchor_logc0_lag{anchor_lag}", np.full((T_dec, 1), logc_anchor, dtype=float)))
+        if anchors:
+            for _, arr in anchors:
+                Xk = np.concatenate([Xk, arr], axis=1)
         # 静态
         Xs = X_st[t]
         # 输出目标: [t+1, t+H]
@@ -238,6 +244,11 @@ def make_sequences(df: pd.DataFrame, seq_len: int, horizon: int, target_type: st
         dfut_list.append(d_f)
         c0_list.append(c0)
 
+    kn_cols_aug = list(kn_cols)
+    anchor_lag = getattr(config, "ANCHOR_LAG", None)
+    if anchor_lag is not None and anchor_lag >= 0:
+        kn_cols_aug.append(f"kn_anchor_logc0_lag{anchor_lag}")
+
     seq = SeqData(
         X_obs=np.asarray(Xo_list),
         X_known=np.asarray(Xk_list),
@@ -246,7 +257,7 @@ def make_sequences(df: pd.DataFrame, seq_len: int, horizon: int, target_type: st
         dates_t=pd.Series(dt_list),
         dates_fut=pd.Series(dfut_list),
         c0=np.asarray(c0_list),
-        feat_names={"obs": obs_cols, "known": kn_cols, "static": st_cols},
+        feat_names={"obs": obs_cols, "known": kn_cols_aug, "static": st_cols},
     )
     # 容错：若无可用样本，给出友好提示
     if seq.X_obs.ndim != 3 or seq.X_obs.shape[0] == 0:

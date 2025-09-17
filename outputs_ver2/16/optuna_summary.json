@@ -1,0 +1,38 @@
+{
+  "n_trials": 1,
+  "best_value": 853.2457996505219,
+  "best_params": {
+    "hidden_size": 160,
+    "nhead": 8,
+    "dropout": 0.30000000000000004,
+    "attn_dropout": 0.3,
+    "ff_dropout": 0.25,
+    "lstm_layers": 2,
+    "lr": 0.0007630429465474486,
+    "weight_decay": 2.6672429023734546e-05,
+    "grad_clip": 1.6626281797378906,
+    "mse_aux_weight": 0.282499595746262,
+    "batch_size": 24
+  },
+  "direction": "MINIMIZE",
+  "history": [
+    {
+      "number": 0,
+      "value": 853.2457996505219,
+      "params": {
+        "hidden_size": 160,
+        "nhead": 8,
+        "dropout": 0.30000000000000004,
+        "attn_dropout": 0.3,
+        "ff_dropout": 0.25,
+        "lstm_layers": 2,
+        "lr": 0.0007630429465474486,
+        "weight_decay": 2.6672429023734546e-05,
+        "grad_clip": 1.6626281797378906,
+        "mse_aux_weight": 0.282499595746262,
+        "batch_size": 24
+      },
+      "state": "COMPLETE"
+    }
+  ]
+}

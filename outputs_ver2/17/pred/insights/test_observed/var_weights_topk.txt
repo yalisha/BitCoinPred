@@ -1,0 +1,10 @@
+obs_DGS5_d_lag1	0.045374
+obs_DGS5_d_lag3	0.045059
+obs_DGS5_d_lag14	0.044491
+obs_DGS5_d_lag7	0.038762
+obs_DGS5_d_lag30	0.037843
+obs_GOLD_ld_lag30	0.034427
+obs_GOLD_ld_lag14	0.030555
+obs_ret_mean_7	0.029714
+obs_OIL_ld_lag30	0.026286
+obs_OIL_ld_lag7	0.025839
