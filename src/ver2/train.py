@@ -23,6 +23,7 @@ from .insights import (
     plot_time_heatmap,
     plot_attention_heatmap,
 )
+from .normalization import create_normalizer, Normalizer
 
 
 def _ensure_finite(name: str, arr: np.ndarray) -> None:
@@ -110,50 +111,6 @@ def _summarize_tft_details(details: Dict[str, object], feat_names: Dict[str, Lis
             "shape": list(attn_mean.shape),
         }
     return summary
-
-
-def _fit_scalers(Xo: np.ndarray, Xk: np.ndarray, Xs: np.ndarray, y: np.ndarray) -> Dict[str, np.ndarray]:
-    stats: Dict[str, np.ndarray] = {}
-    stats["mu_o"] = Xo.mean(axis=(0, 1), keepdims=True)
-    stats["sd_o"] = Xo.std(axis=(0, 1), keepdims=True)
-    stats["sd_o"][stats["sd_o"] < 1e-8] = 1.0
-
-    stats["mu_k"] = Xk.mean(axis=(0, 1), keepdims=True)
-    stats["sd_k"] = Xk.std(axis=(0, 1), keepdims=True)
-    stats["sd_k"][stats["sd_k"] < 1e-8] = 1.0
-
-    stats["mu_s"] = Xs.mean(axis=0, keepdims=True)
-    stats["sd_s"] = Xs.std(axis=0, keepdims=True)
-    stats["sd_s"][stats["sd_s"] < 1e-8] = 1.0
-
-    stats["y_mu"] = y.mean(axis=0, keepdims=True)
-    stats["y_sd"] = y.std(axis=0, keepdims=True)
-    stats["y_sd"][stats["y_sd"] < 1e-8] = 1.0
-    return stats
-
-
-def _normalize_dataset(stats: Dict[str, np.ndarray], *,
-                       Xo: Optional[np.ndarray] = None,
-                       Xk: Optional[np.ndarray] = None,
-                       Xs: Optional[np.ndarray] = None,
-                       y: Optional[np.ndarray] = None) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
-    def _norm(arr: Optional[np.ndarray], mu: np.ndarray, sd: np.ndarray) -> Optional[np.ndarray]:
-        if arr is None:
-            return None
-        return (np.asarray(arr, dtype=float) - mu) / sd
-
-    return (
-        _norm(Xo, stats["mu_o"], stats["sd_o"]),
-        _norm(Xk, stats["mu_k"], stats["sd_k"]),
-        _norm(Xs, stats["mu_s"], stats["sd_s"]),
-        _norm(y, stats["y_mu"], stats["y_sd"]),
-    )
-
-
-def _denormalize_targets(q_pred_z: np.ndarray, stats: Dict[str, np.ndarray]) -> np.ndarray:
-    y_mu = stats["y_mu"].reshape(1, stats["y_mu"].shape[1], 1)
-    y_sd = stats["y_sd"].reshape(1, stats["y_sd"].shape[1], 1)
-    return q_pred_z * y_sd + y_mu
 
 
 def _compute_metric_summary(y_true: np.ndarray,
@@ -344,6 +301,7 @@ def run_time_series_cv(base_cfg: TFTCfg,
                        target_type: str,
                        quantiles: List[float],
                        val_window_len: int,
+                       normalizer_name: str,
                        verbose: bool = True) -> Optional[Dict[str, object]]:
     n_folds = int(train_params.get("cv_folds", 0))
     if n_folds < 2:
@@ -363,9 +321,22 @@ def run_time_series_cv(base_cfg: TFTCfg,
 
     results: List[Dict[str, object]] = []
     for fold_idx, (tr_idx, va_idx) in enumerate(folds, start=1):
-        stats = _fit_scalers(seq_cv.X_obs[tr_idx], seq_cv.X_known[tr_idx], seq_cv.X_static[tr_idx], seq_cv.y[tr_idx])
-        Xo_tr, Xk_tr, Xs_tr, y_tr = _normalize_dataset(stats, Xo=seq_cv.X_obs[tr_idx], Xk=seq_cv.X_known[tr_idx], Xs=seq_cv.X_static[tr_idx], y=seq_cv.y[tr_idx])
-        Xo_va, Xk_va, Xs_va, y_va = _normalize_dataset(stats, Xo=seq_cv.X_obs[va_idx], Xk=seq_cv.X_known[va_idx], Xs=seq_cv.X_static[va_idx], y=seq_cv.y[va_idx])
+        normalizer = create_normalizer(normalizer_name)
+        normalizer.fit(seq_cv.X_obs[tr_idx], seq_cv.X_known[tr_idx], seq_cv.X_static[tr_idx], seq_cv.y[tr_idx])
+        Xo_tr, Xk_tr, Xs_tr, y_tr = normalizer.transform(
+            X_obs=seq_cv.X_obs[tr_idx],
+            X_known=seq_cv.X_known[tr_idx],
+            X_static=seq_cv.X_static[tr_idx],
+            y=seq_cv.y[tr_idx],
+        )
+        Xo_va, Xk_va, Xs_va, y_va = normalizer.transform(
+            X_obs=seq_cv.X_obs[va_idx],
+            X_known=seq_cv.X_known[va_idx],
+            X_static=seq_cv.X_static[va_idx],
+            y=seq_cv.y[va_idx],
+        )
+        assert Xo_tr is not None and Xk_tr is not None and Xs_tr is not None and y_tr is not None
+        assert Xo_va is not None and Xk_va is not None and Xs_va is not None and y_va is not None
 
         fold_cfg = replace(base_cfg)
         model = TFTMultiHQuantile(num_obs=seq_cv.X_obs.shape[-1], num_kn=seq_cv.X_known.shape[-1], num_static=seq_cv.X_static.shape[-1], cfg=fold_cfg)
@@ -386,7 +357,7 @@ def run_time_series_cv(base_cfg: TFTCfg,
         )
 
         q_va_z, _ = predict(model, Xo_va, Xk_va, Xs_va, device=device)
-        q_va = _denormalize_targets(q_va_z, stats)
+        q_va = normalizer.inverse_targets(q_va_z)
         metrics, detail = _compute_fold_metrics(seq_cv.y[va_idx], q_va, seq_cv.c0[va_idx], target_type, quantiles)
 
         fold_info = {
@@ -435,6 +406,7 @@ def run_optuna_study(base_cfg: TFTCfg,
                      device,
                      train_params: Dict[str, float],
                      quantiles: List[float],
+                     normalizer_name: str,
                      val_window_len: Optional[int] = None) -> Optional[Dict[str, object]]:
     try:
         import optuna
@@ -512,6 +484,7 @@ def run_optuna_study(base_cfg: TFTCfg,
             folds = max(2, trial_params.get("cv_folds", 2))
             val_window = max(1, len(seq_cv.y) // (folds + 1))
 
+        trial_normalizer = trial_params.get("normalizer", normalizer_name)
         cv_result = run_time_series_cv(
             cfg_trial,
             seq_cv,
@@ -521,6 +494,7 @@ def run_optuna_study(base_cfg: TFTCfg,
             target_type,
             quantiles,
             val_window,
+            trial_normalizer,
             verbose=False,
         )
         if not cv_result:
@@ -607,6 +581,7 @@ def main():
         "cv_folds": config.CV_FOLDS,
         "min_train": config.CV_MIN_TRAIN_SAMPLES,
         "temporal_smooth_weight": config.TEMPORAL_SMOOTHING_WEIGHT,
+        "normalizer": config.NORMALIZER,
     }
 
     optuna_summary = None
@@ -622,6 +597,7 @@ def main():
             torch_device,
             base_train_params,
             config.QUANTILES,
+            config.NORMALIZER,
             config.CV_VAL_SAMPLES if config.CV_VAL_SAMPLES > 0 else None,
         )
         if optuna_summary and optuna_summary.get("best_params"):
@@ -633,6 +609,7 @@ def main():
         anchor_candidate = int(best_params["anchor_lag"])
         anchor_lag_final = None if anchor_candidate < 0 else anchor_candidate
 
+    normalizer_name_final = best_params["normalizer"] if best_params and "normalizer" in best_params else config.NORMALIZER
     hidden_size_final = int(best_params["hidden_size"]) if best_params and "hidden_size" in best_params else config.HIDDEN_SIZE
     dropout_final = float(best_params["dropout"]) if best_params and "dropout" in best_params else config.DROPOUT
     attn_dropout_final = float(best_params["attn_dropout"]) if best_params and "attn_dropout" in best_params else config.ATTN_DROPOUT
@@ -681,13 +658,31 @@ def main():
             "min_train": config.CV_MIN_TRAIN_SAMPLES,
             "temporal_smooth_weight": temporal_smooth_final,
         }
-        cv_summary = run_time_series_cv(cfg, cv_seq, step_w, torch_device, cv_params, target_type, config.QUANTILES, val_window_len, verbose=True)
+        cv_summary = run_time_series_cv(cfg, cv_seq, step_w, torch_device, cv_params, target_type, config.QUANTILES, val_window_len, normalizer_name_final, verbose=True)
 
-    # 标准化并训练最终模型
-    stats = _fit_scalers(tr_seq.X_obs, tr_seq.X_known, tr_seq.X_static, tr_seq.y)
-    Xo_tr, Xk_tr, Xs_tr, y_tr = _normalize_dataset(stats, Xo=tr_seq.X_obs, Xk=tr_seq.X_known, Xs=tr_seq.X_static, y=tr_seq.y)
-    Xo_va, Xk_va, Xs_va, y_va = _normalize_dataset(stats, Xo=va_seq.X_obs, Xk=va_seq.X_known, Xs=va_seq.X_static, y=va_seq.y)
-    Xo_te, Xk_te, Xs_te, _ = _normalize_dataset(stats, Xo=te_seq.X_obs, Xk=te_seq.X_known, Xs=te_seq.X_static, y=None)
+    normalizer = create_normalizer(normalizer_name_final)
+    normalizer.fit(tr_seq.X_obs, tr_seq.X_known, tr_seq.X_static, tr_seq.y)
+    Xo_tr, Xk_tr, Xs_tr, y_tr = normalizer.transform(
+        X_obs=tr_seq.X_obs,
+        X_known=tr_seq.X_known,
+        X_static=tr_seq.X_static,
+        y=tr_seq.y,
+    )
+    Xo_va, Xk_va, Xs_va, y_va = normalizer.transform(
+        X_obs=va_seq.X_obs,
+        X_known=va_seq.X_known,
+        X_static=va_seq.X_static,
+        y=va_seq.y,
+    )
+    Xo_te, Xk_te, Xs_te, _ = normalizer.transform(
+        X_obs=te_seq.X_obs,
+        X_known=te_seq.X_known,
+        X_static=te_seq.X_static,
+        y=None,
+    )
+    assert Xo_tr is not None and Xk_tr is not None and Xs_tr is not None and y_tr is not None
+    assert Xo_va is not None and Xk_va is not None and Xs_va is not None and y_va is not None
+    assert Xo_te is not None and Xk_te is not None and Xs_te is not None
 
     model = TFTMultiHQuantile(num_obs=Xo_tr.shape[-1], num_kn=Xk_tr.shape[-1], num_static=Xs_tr.shape[-1], cfg=cfg)
     model = train_one(
@@ -708,8 +703,8 @@ def main():
 
     q_va_z, det_va = predict(model, Xo_va, Xk_va, Xs_va, device=torch_device)
     q_te_z, det_te = predict(model, Xo_te, Xk_te, Xs_te, device=torch_device)
-    q_va = _denormalize_targets(q_va_z, stats)
-    q_te = _denormalize_targets(q_te_z, stats)
+    q_va = normalizer.inverse_targets(q_va_z)
+    q_te = normalizer.inverse_targets(q_te_z)
     _ensure_finite("val_quantiles", q_va)
     _ensure_finite("test_quantiles", q_te)
 
@@ -731,6 +726,8 @@ def main():
         segments_payload["test"] = test_diag["segments"]
     if segments_payload:
         metrics_flat["segments"] = segments_payload
+    metrics_flat["normalizer"] = normalizer_name_final
+    metrics_flat["anchor_lag"] = anchor_lag_final if anchor_lag_final is not None else "none"
 
     run_dir = create_next_run_dir(config.OUT_DIR)
     (run_dir / "pred").mkdir(parents=True, exist_ok=True)

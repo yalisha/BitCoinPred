@@ -20,6 +20,7 @@ HORIZON = 5                    # 多步预测长度（天）
 SEQ_LEN = 90                   # 编码器序列长度（天）
 QUANTILES = [0.1, 0.5, 0.9]
 ANCHOR_LAG = 30                 # >=0 使用滞后 log 价格作为已知未来特征；为 None 或 <0 时不添加
+NORMALIZER = "zscore"          # zscore | return_minmax
 
 # 时间切分
 TRAIN_END = "2019-12-31"
