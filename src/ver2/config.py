@@ -48,9 +48,9 @@ GRAD_CLIP = 3.0
 WEIGHT_DECAY = 1e-5
 
 # 时间序列交叉验证
-CV_ENABLED = False
+CV_ENABLED = True
 CV_FOLDS = 4
-CV_EPOCHS = 40
+CV_EPOCHS = 20
 CV_MIN_TRAIN_SAMPLES = 200
 CV_VAL_SAMPLES = 0  # 0 表示使用验证集样本数作为窗口
 
@@ -63,11 +63,12 @@ EVAL_SEGMENTS = [
 ]
 
 # 超参搜索（Optuna）
-ENABLE_OPTUNA = False
+ENABLE_OPTUNA = True
 OPTUNA_TRIALS = 40
-OPTUNA_TIMEOUT = 1800  # 秒，0 表示不限
+OPTUNA_TIMEOUT = 0  # 秒，0 表示不限
 OPTUNA_STUDY = "tft_ver2"
-OPTUNA_STORAGE = None  # 例如 "sqlite:///tft_ver2.db"
+OPTUNA_DB_FILE = BASE_DIR / "optuna_ver2.db"
+OPTUNA_STORAGE = f"sqlite:///{OPTUNA_DB_FILE}"
 
 # 损失加权与校准
 # q50 的 MSE 辅助损失权重
