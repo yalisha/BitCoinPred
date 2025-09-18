@@ -244,6 +244,16 @@ def _segment_indices(dates: Optional[pd.Series], seg_cfg: Dict[str, object]) -> 
     return np.where(mask)[0].astype(int)
 
 
+def _normalize_anchor_lag(value) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        lag = int(value)
+    except (TypeError, ValueError):
+        return None
+    return lag if lag >= 0 else None
+
+
 def _resolve_nhead(d_model: int, requested: int) -> int:
     requested = max(1, int(requested))
     if d_model % requested == 0:
@@ -440,6 +450,9 @@ def run_optuna_study(base_cfg: TFTCfg,
     timeout = int(config.OPTUNA_TIMEOUT) if config.OPTUNA_TIMEOUT else None
 
     def objective(trial: "optuna.trial.Trial") -> float:
+        anchor_choice = trial.suggest_categorical("anchor_lag", [-1, 0, 1, 3, 7, 14])
+        anchor_lag = None if int(anchor_choice) < 0 else int(anchor_choice)
+
         hidden_size = trial.suggest_int("hidden_size", 64, 256, step=32)
         nhead_candidates = [n for n in [1, 2, 4, 8, 16] if n <= hidden_size and hidden_size % n == 0]
         if not nhead_candidates:
@@ -454,6 +467,7 @@ def run_optuna_study(base_cfg: TFTCfg,
         grad_clip = trial.suggest_float("grad_clip", 1.0, 5.0)
         mse_aux = trial.suggest_float("mse_aux_weight", 0.05, 0.3)
         batch_size = trial.suggest_categorical("batch_size", [16, 24, 32, 48])
+        temporal_smooth = trial.suggest_float("temporal_smooth_weight", 0.0, 0.15)
 
         cfg_trial = replace(
             base_cfg,
@@ -466,7 +480,7 @@ def run_optuna_study(base_cfg: TFTCfg,
             ff_dropout=ff_dropout,
         )
 
-        trial_params = train_params.copy()
+        trial_params = dict(train_params)
         trial_params.update({
             "lr": lr,
             "weight_decay": weight_decay,
@@ -474,8 +488,21 @@ def run_optuna_study(base_cfg: TFTCfg,
             "mse_aux_weight": mse_aux,
             "batch_size": batch_size,
             "cv_folds": max(2, min(train_params.get("cv_folds", config.CV_FOLDS), 3)),
-            "temporal_smooth_weight": config.TEMPORAL_SMOOTHING_WEIGHT,
+            "temporal_smooth_weight": temporal_smooth,
         })
+
+        try:
+            seq_cv = make_sequences(cv_df, seq_len, horizon, target_type, anchor_lag=anchor_lag)
+        except ValueError:
+            raise optuna.TrialPruned("sequence construction failed")
+
+        if len(seq_cv.y) < max(3, trial_params.get("cv_folds", 2) + 1):
+            raise optuna.TrialPruned("insufficient samples for CV")
+
+        val_window = val_window_len if (val_window_len and val_window_len > 0) else None
+        if val_window is None:
+            folds = max(2, trial_params.get("cv_folds", 2))
+            val_window = max(1, len(seq_cv.y) // (folds + 1))
 
         cv_result = run_time_series_cv(
             cfg_trial,
@@ -485,7 +512,7 @@ def run_optuna_study(base_cfg: TFTCfg,
             trial_params,
             target_type,
             quantiles,
-            val_window_len,
+            val_window,
             verbose=False,
         )
         if not cv_result:
@@ -527,19 +554,11 @@ def main():
     target_type = config.RETURN_TARGET if config.PREDICT_RETURNS else config.PRED_TARGET
     feat = build_feature_frame(raw, target_type=target_type)
     parts = split_by_date(feat, config.TRAIN_END, config.VAL_END)
-
-    tr_seq = make_sequences(parts['train'], config.SEQ_LEN, config.HORIZON, target_type)
-    va_seq = make_sequences(parts['val'],   config.SEQ_LEN, config.HORIZON, target_type)
-    te_seq = make_sequences(parts['test'],  config.SEQ_LEN, config.HORIZON, target_type)
-
-    need_cv_seq = ((config.CV_ENABLED and config.CV_FOLDS >= 2) or config.ENABLE_OPTUNA)
-    cv_seq: Optional[SeqData] = None
-    if need_cv_seq:
+    cv_df = None
+    if (config.CV_ENABLED and config.CV_FOLDS >= 2) or config.ENABLE_OPTUNA:
         cv_df = pd.concat([parts['train'], parts['val']], ignore_index=True)
         cv_df = cv_df.sort_values('date').reset_index(drop=True)
-        cv_seq = make_sequences(cv_df, config.SEQ_LEN, config.HORIZON, target_type)
 
-    # 步长加权
     if config.STEP_WEIGHT_MODE == 'linear':
         step_w = np.arange(1, config.HORIZON + 1, dtype=float)
         step_w = 1.0 + config.STEP_WEIGHT_ALPHA * step_w
@@ -553,13 +572,14 @@ def main():
     device_name = device_as_str(torch_device)
     print(f"Using torch device: {device_name}")
 
-    requested_heads = min(config.NHEAD, max(1, config.HIDDEN_SIZE // 8))
-    nhead = _resolve_nhead(config.HIDDEN_SIZE, requested_heads)
+    base_hidden_size = config.HIDDEN_SIZE
+    requested_heads = min(config.NHEAD, max(1, base_hidden_size // 8))
+    base_nhead = _resolve_nhead(base_hidden_size, requested_heads)
 
-    cfg = TFTCfg(
-        d_model=config.HIDDEN_SIZE,
-        d_hidden=max(2 * config.HIDDEN_SIZE, 64),
-        nhead=nhead,
+    base_cfg = TFTCfg(
+        d_model=base_hidden_size,
+        d_hidden=max(2 * base_hidden_size, 64),
+        nhead=base_nhead,
         dropout=config.DROPOUT,
         lstm_layers=config.LSTM_LAYERS,
         attn_dropout=config.ATTN_DROPOUT,
@@ -569,38 +589,91 @@ def main():
         device=device_name,
     )
 
-    cv_summary = None
-    val_window_len = config.CV_VAL_SAMPLES if config.CV_VAL_SAMPLES > 0 else len(va_seq.y)
-    if config.CV_ENABLED and cv_seq is not None:
-        cv_params = {
-            "epochs": min(config.EPOCHS, config.CV_EPOCHS),
-            "lr": config.LR,
-            "batch_size": config.BATCH_SIZE,
-            "mse_aux_weight": config.MSE_AUX_WEIGHT,
-            "grad_clip": config.GRAD_CLIP,
-            "weight_decay": config.WEIGHT_DECAY,
-            "cv_folds": config.CV_FOLDS,
-            "min_train": config.CV_MIN_TRAIN_SAMPLES,
-            "temporal_smooth_weight": config.TEMPORAL_SMOOTHING_WEIGHT,
-        }
-        cv_summary = run_time_series_cv(cfg, cv_seq, step_w, torch_device, cv_params, target_type, config.QUANTILES, val_window_len, verbose=True)
+    base_train_params = {
+        "epochs": min(config.EPOCHS, config.CV_EPOCHS),
+        "lr": config.LR,
+        "batch_size": config.BATCH_SIZE,
+        "mse_aux_weight": config.MSE_AUX_WEIGHT,
+        "grad_clip": config.GRAD_CLIP,
+        "weight_decay": config.WEIGHT_DECAY,
+        "cv_folds": config.CV_FOLDS,
+        "min_train": config.CV_MIN_TRAIN_SAMPLES,
+        "temporal_smooth_weight": config.TEMPORAL_SMOOTHING_WEIGHT,
+    }
 
     optuna_summary = None
-    if config.ENABLE_OPTUNA and cv_seq is not None:
-        optuna_params = {
-            "epochs": min(config.EPOCHS, config.CV_EPOCHS),
-            "lr": config.LR,
-            "batch_size": config.BATCH_SIZE,
-            "mse_aux_weight": config.MSE_AUX_WEIGHT,
-            "grad_clip": config.GRAD_CLIP,
-            "weight_decay": config.WEIGHT_DECAY,
+    best_params = None
+    if config.ENABLE_OPTUNA:
+        optuna_summary = run_optuna_study(
+            base_cfg,
+            cv_df,
+            target_type,
+            config.SEQ_LEN,
+            config.HORIZON,
+            step_w,
+            torch_device,
+            base_train_params,
+            config.QUANTILES,
+            config.CV_VAL_SAMPLES if config.CV_VAL_SAMPLES > 0 else None,
+        )
+        if optuna_summary and optuna_summary.get("best_params"):
+            best_params = optuna_summary["best_params"]
+            print("Optuna 最佳参数:", best_params)
+
+    anchor_lag_final = _normalize_anchor_lag(config.ANCHOR_LAG)
+    if best_params and "anchor_lag" in best_params:
+        anchor_candidate = int(best_params["anchor_lag"])
+        anchor_lag_final = None if anchor_candidate < 0 else anchor_candidate
+
+    hidden_size_final = int(best_params["hidden_size"]) if best_params and "hidden_size" in best_params else config.HIDDEN_SIZE
+    dropout_final = float(best_params["dropout"]) if best_params and "dropout" in best_params else config.DROPOUT
+    attn_dropout_final = float(best_params["attn_dropout"]) if best_params and "attn_dropout" in best_params else config.ATTN_DROPOUT
+    ff_dropout_final = float(best_params["ff_dropout"]) if best_params and "ff_dropout" in best_params else config.FF_DROPOUT
+    lstm_layers_final = int(best_params["lstm_layers"]) if best_params and "lstm_layers" in best_params else config.LSTM_LAYERS
+    nhead_final = int(best_params["nhead"]) if best_params and "nhead" in best_params else _resolve_nhead(hidden_size_final, min(config.NHEAD, max(1, hidden_size_final // 8)))
+
+    batch_size_final = int(best_params["batch_size"]) if best_params and "batch_size" in best_params else config.BATCH_SIZE
+    lr_final = float(best_params["lr"]) if best_params and "lr" in best_params else config.LR
+    weight_decay_final = float(best_params["weight_decay"]) if best_params and "weight_decay" in best_params else config.WEIGHT_DECAY
+    grad_clip_final = float(best_params["grad_clip"]) if best_params and "grad_clip" in best_params else config.GRAD_CLIP
+    mse_aux_final = float(best_params["mse_aux_weight"]) if best_params and "mse_aux_weight" in best_params else config.MSE_AUX_WEIGHT
+    temporal_smooth_final = float(best_params["temporal_smooth_weight"]) if best_params and "temporal_smooth_weight" in best_params else config.TEMPORAL_SMOOTHING_WEIGHT
+    epochs_final = config.EPOCHS
+
+    cfg = TFTCfg(
+        d_model=hidden_size_final,
+        d_hidden=max(2 * hidden_size_final, 64),
+        nhead=nhead_final,
+        dropout=dropout_final,
+        lstm_layers=lstm_layers_final,
+        attn_dropout=attn_dropout_final,
+        ff_dropout=ff_dropout_final,
+        horizon=config.HORIZON,
+        quantiles=config.QUANTILES,
+        device=device_name,
+    )
+
+    tr_seq = make_sequences(parts['train'], config.SEQ_LEN, config.HORIZON, target_type, anchor_lag=anchor_lag_final)
+    va_seq = make_sequences(parts['val'],   config.SEQ_LEN, config.HORIZON, target_type, anchor_lag=anchor_lag_final)
+    te_seq = make_sequences(parts['test'],  config.SEQ_LEN, config.HORIZON, target_type, anchor_lag=anchor_lag_final)
+
+    val_window_len = config.CV_VAL_SAMPLES if config.CV_VAL_SAMPLES > 0 else len(va_seq.y)
+
+    cv_summary = None
+    if config.CV_ENABLED and cv_df is not None and config.CV_FOLDS >= 2:
+        cv_seq = make_sequences(cv_df, config.SEQ_LEN, config.HORIZON, target_type, anchor_lag=anchor_lag_final)
+        cv_params = {
+            "epochs": min(epochs_final, config.CV_EPOCHS),
+            "lr": lr_final,
+            "batch_size": batch_size_final,
+            "mse_aux_weight": mse_aux_final,
+            "grad_clip": grad_clip_final,
+            "weight_decay": weight_decay_final,
             "cv_folds": config.CV_FOLDS,
             "min_train": config.CV_MIN_TRAIN_SAMPLES,
-            "temporal_smooth_weight": config.TEMPORAL_SMOOTHING_WEIGHT,
+            "temporal_smooth_weight": temporal_smooth_final,
         }
-        optuna_summary = run_optuna_study(cfg, cv_seq, step_w, torch_device, optuna_params, target_type, config.QUANTILES, val_window_len)
-        if optuna_summary and optuna_summary.get("best_params"):
-            print("Optuna 最佳参数:", optuna_summary["best_params"])
+        cv_summary = run_time_series_cv(cfg, cv_seq, step_w, torch_device, cv_params, target_type, config.QUANTILES, val_window_len, verbose=True)
 
     # 标准化并训练最终模型
     stats = _fit_scalers(tr_seq.X_obs, tr_seq.X_known, tr_seq.X_static, tr_seq.y)
@@ -614,15 +687,15 @@ def main():
         model,
         (Xo_tr, Xk_tr, Xs_tr, y_tr),
         (Xo_va, Xk_va, Xs_va, y_va),
-        epochs=config.EPOCHS,
-        lr=config.LR,
-        batch_size=config.BATCH_SIZE,
+        epochs=epochs_final,
+        lr=lr_final,
+        batch_size=batch_size_final,
         device=torch_device,
         step_weights_np=step_w,
-        mse_aux_weight=config.MSE_AUX_WEIGHT,
-        grad_clip_norm=config.GRAD_CLIP,
-        weight_decay=config.WEIGHT_DECAY,
-        temporal_smooth_weight=config.TEMPORAL_SMOOTHING_WEIGHT,
+        mse_aux_weight=mse_aux_final,
+        grad_clip_norm=grad_clip_final,
+        weight_decay=weight_decay_final,
+        temporal_smooth_weight=temporal_smooth_final,
     )
 
     q_va_z, det_va = predict(model, Xo_va, Xk_va, Xs_va, device=torch_device)

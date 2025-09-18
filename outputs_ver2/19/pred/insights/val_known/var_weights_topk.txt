@@ -1,0 +1,10 @@
+kn_is_month_end	0.076575
+kn_event_halving1	0.073747
+kn_event_halving4	0.073129
+kn_event_nfp	0.063595
+kn_is_weekend	0.057007
+kn_is_quarter_start	0.055195
+kn_doy_sin	0.044282
+kn_is_quarter_end	0.042428
+kn_is_year_start	0.040628
+kn_event_dom_10	0.039877

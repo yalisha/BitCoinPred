@@ -1,0 +1,10 @@
+kn_event_halving4	0.088467
+kn_event_nfp	0.084070
+kn_is_month_end	0.071045
+kn_event_halving1	0.068405
+kn_is_weekend	0.053039
+kn_is_quarter_start	0.051378
+kn_event_cpi	0.042156
+kn_doy_sin	0.041281
+kn_event_dom_10	0.039679
+kn_is_quarter_end	0.039583

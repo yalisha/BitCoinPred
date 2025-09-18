@@ -5,10 +5,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 
 import numpy as np
 import pandas as pd
+
+from . import config
 
 
 def load_raw(csv_path: Path) -> pd.DataFrame:
@@ -177,7 +179,11 @@ class SeqData:
     feat_names: Dict[str, list]
 
 
-def make_sequences(df: pd.DataFrame, seq_len: int, horizon: int, target_type: str) -> SeqData:
+def make_sequences(df: pd.DataFrame,
+                   seq_len: int,
+                   horizon: int,
+                   target_type: str,
+                   anchor_lag: Optional[int] = None) -> SeqData:
     # 列分组
     obs_cols = [c for c in df.columns if c.startswith("obs_")]
     kn_cols  = [c for c in df.columns if c.startswith("kn_")]
@@ -206,6 +212,16 @@ def make_sequences(df: pd.DataFrame, seq_len: int, horizon: int, target_type: st
     T_dec = horizon
 
     Xo_list, Xk_list, Xs_list, y_list, dt_list, dfut_list, c0_list = [], [], [], [], [], [], []
+    anchor_lag_value = anchor_lag
+    if anchor_lag_value is None:
+        anchor_cfg = getattr(config, "ANCHOR_LAG", None)
+        if anchor_cfg is None:
+            anchor_lag_value = None
+        else:
+            anchor_lag_value = int(anchor_cfg)
+    if anchor_lag_value is not None and anchor_lag_value < 0:
+        anchor_lag_value = None
+
     for t in range(T_enc-1, n - T_dec):
         # 编码器窗口: [t-seq_len+1, t]
         Xo = X_obs[t-T_enc+1: t+1]
@@ -213,11 +229,10 @@ def make_sequences(df: pd.DataFrame, seq_len: int, horizon: int, target_type: st
         Xk = X_kn[t+1: t+1+T_dec]
         # 可选：加入滞后 log 价格锚点
         anchors = []
-        anchor_lag = getattr(config, "ANCHOR_LAG", None)
-        if anchor_lag is not None and anchor_lag >= 0:
-            lag_idx = max(0, t - int(anchor_lag))
+        if anchor_lag_value is not None:
+            lag_idx = max(0, t - anchor_lag_value)
             logc_anchor = log_close[lag_idx]
-            anchors.append((f"kn_anchor_logc0_lag{anchor_lag}", np.full((T_dec, 1), logc_anchor, dtype=float)))
+            anchors.append((f"kn_anchor_logc0_lag{anchor_lag_value}", np.full((T_dec, 1), logc_anchor, dtype=float)))
         if anchors:
             for _, arr in anchors:
                 Xk = np.concatenate([Xk, arr], axis=1)
@@ -245,9 +260,8 @@ def make_sequences(df: pd.DataFrame, seq_len: int, horizon: int, target_type: st
         c0_list.append(c0)
 
     kn_cols_aug = list(kn_cols)
-    anchor_lag = getattr(config, "ANCHOR_LAG", None)
-    if anchor_lag is not None and anchor_lag >= 0:
-        kn_cols_aug.append(f"kn_anchor_logc0_lag{anchor_lag}")
+    if anchor_lag_value is not None:
+        kn_cols_aug.append(f"kn_anchor_logc0_lag{anchor_lag_value}")
 
     seq = SeqData(
         X_obs=np.asarray(Xo_list),
