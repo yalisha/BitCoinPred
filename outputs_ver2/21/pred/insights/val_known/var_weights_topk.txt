@@ -1,0 +1,10 @@
+kn_anchor_logc0_lag30	0.688139
+kn_event_dom_15	0.031769
+kn_event_dom_10	0.031240
+kn_event_dom_20	0.031184
+kn_event_dom_12	0.030283
+kn_event_dom_25	0.030168
+kn_event_dom_1	0.029936
+kn_event_halving3	0.014942
+kn_is_quarter_end	0.007481
+kn_doy_cos	0.007381

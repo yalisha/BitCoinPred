@@ -20,7 +20,7 @@ HORIZON = 5                    # 多步预测长度（天）
 SEQ_LEN = 90                   # 编码器序列长度（天）
 QUANTILES = [0.1, 0.5, 0.9]
 ANCHOR_LAG = 30                 # >=0 使用滞后 log 价格作为已知未来特征；为 None 或 <0 时不添加
-NORMALIZER = "zscore"          # zscore | return_minmax
+NORMALIZER = "return_minmax"          # zscore | return_minmax
 
 # 时间切分
 TRAIN_END = "2019-12-31"
@@ -43,7 +43,7 @@ GRAD_CLIP = 3.0
 WEIGHT_DECAY = 1e-5
 
 # 时间序列交叉验证
-CV_ENABLED = True
+CV_ENABLED = False
 CV_FOLDS = 4
 CV_EPOCHS = 40
 CV_MIN_TRAIN_SAMPLES = 200
@@ -58,7 +58,7 @@ EVAL_SEGMENTS = [
 ]
 
 # 超参搜索（Optuna）
-ENABLE_OPTUNA = True
+ENABLE_OPTUNA = False
 OPTUNA_TRIALS = 40
 OPTUNA_TIMEOUT = 1800  # 秒，0 表示不限
 OPTUNA_STUDY = "tft_ver2"

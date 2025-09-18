@@ -1,0 +1,10 @@
+obs_DGS5_d_lag30	0.048722
+obs_DGS5_d_lag1	0.047019
+obs_DGS5_d_lag3	0.046510
+obs_DGS5_d_lag14	0.041348
+obs_DGS5_d_lag7	0.040216
+obs_GOLD_ld_lag30	0.032600
+obs_GOLD_ld_lag14	0.028046
+obs_GOLD_ld_lag7	0.027953
+obs_VIX_ld_lag3	0.023196
+obs_GOLD_ld_lag3	0.023069
