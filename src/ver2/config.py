@@ -19,7 +19,7 @@ RETURN_TARGET = "logret"       # 当 PREDICT_RETURNS=True 时使用的目标类�
 HORIZON = 5                    # 多步预测长度（天）
 SEQ_LEN = 90                   # 编码器序列长度（天）
 QUANTILES = [0.1, 0.5, 0.9]
-ANCHOR_LAG = None                 # >=0 使用滞后 log 价格作为已知未来特征；为 None 或 <0 时不添加
+ANCHOR_LAG = 30                 # >=0 使用滞后 log 价格作为已知未来特征；为 None 或 <0 时不添加
 
 # 时间切分
 TRAIN_END = "2019-12-31"
@@ -58,7 +58,7 @@ EVAL_SEGMENTS = [
 
 # 超参搜索（Optuna）
 ENABLE_OPTUNA = True
-OPTUNA_TRIALS = 20
+OPTUNA_TRIALS = 40
 OPTUNA_TIMEOUT = 1800  # 秒，0 表示不限
 OPTUNA_STUDY = "tft_ver2"
 OPTUNA_STORAGE = None  # 例如 "sqlite:///tft_ver2.db"

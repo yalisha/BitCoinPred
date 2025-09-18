@@ -427,18 +427,26 @@ def run_time_series_cv(base_cfg: TFTCfg,
 
 
 def run_optuna_study(base_cfg: TFTCfg,
-                     seq_cv: SeqData,
+                     cv_df: Optional[pd.DataFrame],
+                     target_type: str,
+                     seq_len: int,
+                     horizon: int,
                      step_weights_np: Optional[np.ndarray],
                      device,
                      train_params: Dict[str, float],
-                     target_type: str,
                      quantiles: List[float],
-                     val_window_len: int) -> Optional[Dict[str, object]]:
+                     val_window_len: Optional[int] = None) -> Optional[Dict[str, object]]:
     try:
         import optuna
     except ImportError:
         print("Optuna 未安装，跳过超参搜索。")
         return None
+
+    if cv_df is None or cv_df.empty:
+        print("Optuna 未找到可用的 CV 数据，跳过。")
+        return None
+
+    cv_df = cv_df.sort_values('date').reset_index(drop=True)
 
     study_kwargs = {"direction": "minimize", "study_name": config.OPTUNA_STUDY}
     if config.OPTUNA_STORAGE:
