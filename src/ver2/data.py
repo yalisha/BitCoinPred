@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Tuple, Optional
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -179,11 +179,66 @@ class SeqData:
     feat_names: Dict[str, list]
 
 
+def resolve_anchor_spec(anchor_cfg: Any) -> Optional[Dict[str, Any]]:
+    """Normalize anchor configuration into a dict with lags/dropout/noise."""
+    if anchor_cfg is None:
+        return None
+
+    lags: Sequence[int] = []
+    dropout = 0.0
+    noise_std = 0.0
+    seed: Optional[int] = None
+
+    if isinstance(anchor_cfg, dict):
+        raw_lags = anchor_cfg.get("lags")
+        if raw_lags is None and anchor_cfg.get("lag") is not None:
+            raw_lags = [anchor_cfg.get("lag")]
+        lags = raw_lags if raw_lags is not None else []
+        dropout = float(anchor_cfg.get("dropout", anchor_cfg.get("dropout_prob", 0.0)))
+        noise_std = float(anchor_cfg.get("noise_std", anchor_cfg.get("noise", 0.0)))
+        if "seed" in anchor_cfg:
+            try:
+                seed = int(anchor_cfg["seed"])
+            except (TypeError, ValueError):
+                seed = None
+    elif isinstance(anchor_cfg, (list, tuple, set)):
+        lags = list(anchor_cfg)
+    else:
+        try:
+            lags = [int(anchor_cfg)]
+        except (TypeError, ValueError):
+            return None
+
+    cleaned_lags_set = set()
+    for l in lags:
+        try:
+            lag_val = int(float(l))
+        except (TypeError, ValueError):
+            continue
+        if lag_val >= 0:
+            cleaned_lags_set.add(lag_val)
+    cleaned_lags = sorted(cleaned_lags_set)
+    if not cleaned_lags:
+        return None
+
+    dropout = min(max(float(dropout), 0.0), 1.0)
+    noise_std = max(float(noise_std), 0.0)
+
+    spec: Dict[str, Any] = {
+        "lags": cleaned_lags,
+        "dropout": dropout,
+        "noise_std": noise_std,
+    }
+    if seed is not None:
+        spec["seed"] = seed
+    return spec
+
+
 def make_sequences(df: pd.DataFrame,
                    seq_len: int,
                    horizon: int,
                    target_type: str,
-                   anchor_lag: Optional[int] = None) -> SeqData:
+                   anchor_cfg: Optional[Any] = None) -> SeqData:
     # 列分组
     obs_cols = [c for c in df.columns if c.startswith("obs_")]
     kn_cols  = [c for c in df.columns if c.startswith("kn_")]
@@ -212,15 +267,11 @@ def make_sequences(df: pd.DataFrame,
     T_dec = horizon
 
     Xo_list, Xk_list, Xs_list, y_list, dt_list, dfut_list, c0_list = [], [], [], [], [], [], []
-    anchor_lag_value = anchor_lag
-    if anchor_lag_value is None:
-        anchor_cfg = getattr(config, "ANCHOR_LAG", None)
-        if anchor_cfg is None:
-            anchor_lag_value = None
-        else:
-            anchor_lag_value = int(anchor_cfg)
-    if anchor_lag_value is not None and anchor_lag_value < 0:
-        anchor_lag_value = None
+    anchor_spec = resolve_anchor_spec(anchor_cfg if anchor_cfg is not None else getattr(config, "ANCHOR_LAG", None))
+    rng = None
+    if anchor_spec and (anchor_spec.get("dropout", 0.0) > 0.0 or anchor_spec.get("noise_std", 0.0) > 0.0):
+        seed = anchor_spec.get("seed", 20240501)
+        rng = np.random.default_rng(seed)
 
     for t in range(T_enc-1, n - T_dec):
         # 编码器窗口: [t-seq_len+1, t]
@@ -229,10 +280,19 @@ def make_sequences(df: pd.DataFrame,
         Xk = X_kn[t+1: t+1+T_dec]
         # 可选：加入滞后 log 价格锚点
         anchors = []
-        if anchor_lag_value is not None:
-            lag_idx = max(0, t - anchor_lag_value)
-            logc_anchor = log_close[lag_idx]
-            anchors.append((f"kn_anchor_logc0_lag{anchor_lag_value}", np.full((T_dec, 1), logc_anchor, dtype=float)))
+        if anchor_spec is not None:
+            for lag in anchor_spec["lags"]:
+                lag_idx = max(0, t - lag)
+                logc_anchor = log_close[lag_idx]
+                arr = np.full((T_dec, 1), logc_anchor, dtype=float)
+                if rng is not None:
+                    noise_std = anchor_spec.get("noise_std", 0.0)
+                    if noise_std > 0.0:
+                        arr = arr + rng.normal(0.0, noise_std, size=arr.shape)
+                    dropout = anchor_spec.get("dropout", 0.0)
+                    if dropout > 0.0 and rng.random() < dropout:
+                        arr[:] = 0.0
+                anchors.append((f"kn_anchor_logc0_lag{lag}", arr))
         if anchors:
             for _, arr in anchors:
                 Xk = np.concatenate([Xk, arr], axis=1)
@@ -260,8 +320,11 @@ def make_sequences(df: pd.DataFrame,
         c0_list.append(c0)
 
     kn_cols_aug = list(kn_cols)
-    if anchor_lag_value is not None:
-        kn_cols_aug.append(f"kn_anchor_logc0_lag{anchor_lag_value}")
+    if anchor_spec is not None:
+        for lag in anchor_spec["lags"]:
+            name = f"kn_anchor_logc0_lag{lag}"
+            if name not in kn_cols_aug:
+                kn_cols_aug.append(name)
 
     seq = SeqData(
         X_obs=np.asarray(Xo_list),

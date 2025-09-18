@@ -19,8 +19,13 @@ RETURN_TARGET = "logret"       # 当 PREDICT_RETURNS=True 时使用的目标类�
 HORIZON = 5                    # 多步预测长度（天）
 SEQ_LEN = 90                   # 编码器序列长度（天）
 QUANTILES = [0.1, 0.5, 0.9]
-ANCHOR_LAG = 30                 # >=0 使用滞后 log 价格作为已知未来特征；为 None 或 <0 时不添加
-NORMALIZER = "return_minmax"          # zscore | return_minmax
+ANCHOR_LAG = {
+    "lags": [7,30],              # 列表支持多滞后锚点; 传 [] 或 None 禁用
+    "dropout": 0.0,            # 在序列层面对 anchor 做丢弃概率
+    "noise_std": 0.0,          # 给 anchor 注入高斯噪声（log 价格空间）
+    "seed": 20240501,          # 控制 dropout/噪声的可重复性
+}                               # 也可直接使用 int/list/None 保持兼容
+NORMALIZER = "return_robust"          # zscore | return_minmax | return_robust
 
 # 时间切分
 TRAIN_END = "2019-12-31"

@@ -126,9 +126,51 @@ class ReturnMinMaxNormalizer(Normalizer):
         return y_scaled * span.reshape(1, span.shape[1], 1) + self.y_min.reshape(1, self.y_min.shape[1], 1)
 
 
+@dataclass
+class ReturnRobustNormalizer(Normalizer):
+    """Robust scaling for targets with optional clipping, z-score for features."""
+
+    zscore_norm: ZScoreNormalizer = field(default_factory=ZScoreNormalizer)
+    y_center: Optional[np.ndarray] = None
+    y_scale: Optional[np.ndarray] = None
+    clip: float = 6.0
+
+    def fit(self, X_obs: np.ndarray, X_known: np.ndarray, X_static: np.ndarray, y: np.ndarray) -> "ReturnRobustNormalizer":
+        self.zscore_norm.fit(X_obs, X_known, X_static, y)
+        median = np.median(y, axis=0, keepdims=True)
+        q25 = np.quantile(y, 0.25, axis=0, keepdims=True)
+        q75 = np.quantile(y, 0.75, axis=0, keepdims=True)
+        scale = q75 - q25
+        scale[scale < 1e-6] = 1.0
+        self.y_center = median
+        self.y_scale = scale
+        return self
+
+    def transform(self,
+                  X_obs: Optional[np.ndarray] = None,
+                  X_known: Optional[np.ndarray] = None,
+                  X_static: Optional[np.ndarray] = None,
+                  y: Optional[np.ndarray] = None) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+        X_obs_n, X_known_n, X_static_n, _ = self.zscore_norm.transform(X_obs, X_known, X_static, None)
+        y_n = None
+        if y is not None:
+            if self.y_center is None or self.y_scale is None:
+                raise RuntimeError("ReturnRobustNormalizer not fit")
+            y_n = (y - self.y_center) / self.y_scale
+            if self.clip and self.clip > 0:
+                y_n = np.clip(y_n, -self.clip, self.clip)
+        return X_obs_n, X_known_n, X_static_n, y_n
+
+    def inverse_targets(self, y_scaled: np.ndarray) -> np.ndarray:
+        if self.y_center is None or self.y_scale is None:
+            raise RuntimeError("ReturnRobustNormalizer not fit")
+        return y_scaled * self.y_scale.reshape(1, self.y_scale.shape[1], 1) + self.y_center.reshape(1, self.y_center.shape[1], 1)
+
+
 NORMALIZER_REGISTRY: Dict[str, type[Normalizer]] = {
     "zscore": ZScoreNormalizer,
     "return_minmax": ReturnMinMaxNormalizer,
+    "return_robust": ReturnRobustNormalizer,
 }
 
 

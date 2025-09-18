@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import json
 import numpy as np
@@ -13,7 +13,7 @@ from device import get_torch_device, device_as_str
 
 from . import config
 from .utils import create_next_run_dir
-from .data import load_raw, build_feature_frame, split_by_date, make_sequences, SeqData
+from .data import load_raw, build_feature_frame, split_by_date, make_sequences, SeqData, resolve_anchor_spec
 from .model_tft import TFTCfg, TFTMultiHQuantile, train_one, predict
 from .plots import plot_price_series, plot_step_series, plot_quantile_band, plot_step_metric, plot_bar
 from .insights import (
@@ -201,14 +201,18 @@ def _segment_indices(dates: Optional[pd.Series], seg_cfg: Dict[str, object]) -> 
     return np.where(mask)[0].astype(int)
 
 
-def _normalize_anchor_lag(value) -> Optional[int]:
-    if value is None:
+def _make_anchor_spec(config_value: Any, override_lag: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    base_spec = resolve_anchor_spec(config_value)
+    if override_lag is None:
+        return base_spec
+    if override_lag < 0:
         return None
-    try:
-        lag = int(value)
-    except (TypeError, ValueError):
-        return None
-    return lag if lag >= 0 else None
+    override_raw: Dict[str, Any] = {"lags": [override_lag]}
+    if base_spec:
+        for key in ("dropout", "noise_std", "seed"):
+            if key in base_spec:
+                override_raw[key] = base_spec[key]
+    return resolve_anchor_spec(override_raw)
 
 
 def _resolve_nhead(d_model: int, requested: int) -> int:
@@ -431,7 +435,11 @@ def run_optuna_study(base_cfg: TFTCfg,
 
     def objective(trial: "optuna.trial.Trial") -> float:
         anchor_choice = trial.suggest_categorical("anchor_lag", [-1, 0, 1, 3, 7, 14])
-        anchor_lag = None if int(anchor_choice) < 0 else int(anchor_choice)
+        anchor_choice_int = int(anchor_choice)
+        if anchor_choice_int < 0:
+            anchor_spec_trial = None
+        else:
+            anchor_spec_trial = _make_anchor_spec(config.ANCHOR_LAG, override_lag=anchor_choice_int)
 
         hidden_size = trial.suggest_int("hidden_size", 64, 256, step=32)
         nhead_candidates = [n for n in [1, 2, 4, 8, 16] if n <= hidden_size and hidden_size % n == 0]
@@ -472,7 +480,7 @@ def run_optuna_study(base_cfg: TFTCfg,
         })
 
         try:
-            seq_cv = make_sequences(cv_df, seq_len, horizon, target_type, anchor_lag=anchor_lag)
+            seq_cv = make_sequences(cv_df, seq_len, horizon, target_type, anchor_cfg=anchor_spec_trial)
         except ValueError:
             raise optuna.TrialPruned("sequence construction failed")
 
@@ -604,10 +612,13 @@ def main():
             best_params = optuna_summary["best_params"]
             print("Optuna 最佳参数:", best_params)
 
-    anchor_lag_final = _normalize_anchor_lag(config.ANCHOR_LAG)
+    anchor_spec_final = resolve_anchor_spec(config.ANCHOR_LAG)
     if best_params and "anchor_lag" in best_params:
         anchor_candidate = int(best_params["anchor_lag"])
-        anchor_lag_final = None if anchor_candidate < 0 else anchor_candidate
+        if anchor_candidate < 0:
+            anchor_spec_final = None
+        else:
+            anchor_spec_final = _make_anchor_spec(config.ANCHOR_LAG, override_lag=anchor_candidate)
 
     normalizer_name_final = best_params["normalizer"] if best_params and "normalizer" in best_params else config.NORMALIZER
     hidden_size_final = int(best_params["hidden_size"]) if best_params and "hidden_size" in best_params else config.HIDDEN_SIZE
@@ -638,15 +649,15 @@ def main():
         device=device_name,
     )
 
-    tr_seq = make_sequences(parts['train'], config.SEQ_LEN, config.HORIZON, target_type, anchor_lag=anchor_lag_final)
-    va_seq = make_sequences(parts['val'],   config.SEQ_LEN, config.HORIZON, target_type, anchor_lag=anchor_lag_final)
-    te_seq = make_sequences(parts['test'],  config.SEQ_LEN, config.HORIZON, target_type, anchor_lag=anchor_lag_final)
+    tr_seq = make_sequences(parts['train'], config.SEQ_LEN, config.HORIZON, target_type, anchor_cfg=anchor_spec_final)
+    va_seq = make_sequences(parts['val'],   config.SEQ_LEN, config.HORIZON, target_type, anchor_cfg=anchor_spec_final)
+    te_seq = make_sequences(parts['test'],  config.SEQ_LEN, config.HORIZON, target_type, anchor_cfg=anchor_spec_final)
 
     val_window_len = config.CV_VAL_SAMPLES if config.CV_VAL_SAMPLES > 0 else len(va_seq.y)
 
     cv_summary = None
     if config.CV_ENABLED and cv_df is not None and config.CV_FOLDS >= 2:
-        cv_seq = make_sequences(cv_df, config.SEQ_LEN, config.HORIZON, target_type, anchor_lag=anchor_lag_final)
+        cv_seq = make_sequences(cv_df, config.SEQ_LEN, config.HORIZON, target_type, anchor_cfg=anchor_spec_final)
         cv_params = {
             "epochs": min(epochs_final, config.CV_EPOCHS),
             "lr": lr_final,
@@ -727,7 +738,12 @@ def main():
     if segments_payload:
         metrics_flat["segments"] = segments_payload
     metrics_flat["normalizer"] = normalizer_name_final
-    metrics_flat["anchor_lag"] = anchor_lag_final if anchor_lag_final is not None else "none"
+    if anchor_spec_final:
+        metrics_flat["anchor_lags"] = list(anchor_spec_final.get("lags", []))
+        metrics_flat["anchor_dropout"] = float(anchor_spec_final.get("dropout", 0.0))
+        metrics_flat["anchor_noise_std"] = float(anchor_spec_final.get("noise_std", 0.0))
+    else:
+        metrics_flat["anchor_lags"] = []
 
     run_dir = create_next_run_dir(config.OUT_DIR)
     (run_dir / "pred").mkdir(parents=True, exist_ok=True)
