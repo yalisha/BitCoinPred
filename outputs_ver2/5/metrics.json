@@ -1,8 +1,0 @@
-{
-  "val_rmse_h1_price": 1321.0678051433654,
-  "val_mae_h1_price": 829.3312330097083,
-  "test_rmse_h1_price": 1665.2091462374644,
-  "test_mae_h1_price": 1099.453199566161,
-  "val_rmse_avg_steps": 2511.3235501430495,
-  "test_rmse_avg_steps": 3028.679271886761
-}

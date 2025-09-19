@@ -1,8 +1,0 @@
-{
-  "val_rmse_h1_price": NaN,
-  "val_mae_h1_price": NaN,
-  "test_rmse_h1_price": NaN,
-  "test_mae_h1_price": NaN,
-  "val_rmse_avg_steps": NaN,
-  "test_rmse_avg_steps": NaN
-}

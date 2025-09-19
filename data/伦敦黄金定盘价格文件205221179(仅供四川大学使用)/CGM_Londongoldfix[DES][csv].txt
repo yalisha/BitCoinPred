@@ -1,3 +1,0 @@
-Trddt [交易日期] - YYYY-MM-DD，以格林威治时间统计
-Amprice [上午定盘价] - 
-Pmprice [下午定盘价] - 
